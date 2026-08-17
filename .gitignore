@@ -1,0 +1,15 @@
+target/
+node_modules/
+dist/
+.astro/
+proto/gen/
+.pnpm-store/
+.dev.vars
+.env
+.env.*
+!.env.example
+.DS_Store
+*.zip
+*.tar.gz
+apps/plugin/target/
+.wrangler/

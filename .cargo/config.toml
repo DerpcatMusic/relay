@@ -1,0 +1,4 @@
+[alias]
+relay-check = "check --locked -p relay-domain --all-targets --all-features"
+relay-test = "nextest run --locked -p relay-domain --all-targets --all-features"
+relay-lint = "clippy --locked -p relay-domain --all-targets --all-features -- -D warnings"

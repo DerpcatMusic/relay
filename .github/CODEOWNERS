@@ -1,0 +1,15 @@
+# Default ownership for every repository path.
+* @DerpcatMusic
+
+# Foundation policy and automation require explicit review ownership.
+/.github/ @DerpcatMusic
+/.github/workflows/ @DerpcatMusic
+/justfile @DerpcatMusic
+/tools/ @DerpcatMusic
+
+# Architecture, contracts, and implementation surfaces.
+/docs/ @DerpcatMusic
+/proto/ @DerpcatMusic
+/crates/ @DerpcatMusic
+/packages/ @DerpcatMusic
+/apps/ @DerpcatMusic

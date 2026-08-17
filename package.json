@@ -1,0 +1,17 @@
+{
+  "name": "relay",
+  "private": true,
+  "license": "MPL-2.0",
+  "packageManager": "pnpm@11.22.0",
+  "scripts": {
+    "build": "pnpm --recursive build",
+    "typecheck": "pnpm --recursive typecheck",
+    "test": "pnpm --recursive --if-present test"
+  },
+  "devDependencies": {
+    "typescript": "7.0.2"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  }
+}

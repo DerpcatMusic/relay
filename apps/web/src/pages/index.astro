@@ -1,0 +1,71 @@
+---
+const origin = "https://relay.matari-audio.com";
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="RELAY listen pages. Open a session from the plugin and share the URL."
+    />
+    <title>RELAY</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Barlow:wght@500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        --bg: #191919;
+        --lane: #252525;
+        --text: #ffffff;
+        --muted: #b8b8b8;
+        --accent: #00aaff;
+        --ice: #25e7ff;
+      }
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        min-height: 100%;
+        background: var(--bg);
+        color: var(--text);
+        font-family: Barlow, system-ui, sans-serif;
+      }
+      ::selection { background: var(--accent); color: #041018; }
+      body { display: flex; justify-content: center; padding: clamp(24px, 6vw, 72px) 20px; }
+      main { width: min(440px, 100%); }
+      .brand {
+        font-size: 13px;
+        font-weight: 700;
+        letter-spacing: 0.14em;
+        color: var(--ice);
+        margin: 0 0 28px;
+      }
+      h1 {
+        font-size: clamp(32px, 7vw, 48px);
+        line-height: 1;
+        letter-spacing: -0.03em;
+        margin: 0 0 16px;
+      }
+      p { color: var(--muted); font-size: 16px; line-height: 1.45; }
+      code { color: var(--ice); }
+      a { color: var(--ice); }
+    </style>
+  </head>
+  <body>
+    <main>
+      <p class="brand">RELAY</p>
+      <h1>Listen</h1>
+      <p>
+        A session starts when you open the plugin. Copy the URL and send it.
+        This page converts 48 kHz audio to whatever your speakers actually run.
+      </p>
+      <p>
+        Open <code>{origin}/&lt;session-name&gt;</code>
+      </p>
+    </main>
+  </body>
+</html>

@@ -1,0 +1,37 @@
+[workspace]
+members = [
+    "apps/audio-lab",
+    "crates/relay-audio",
+    "crates/relay-clock",
+    "crates/relay-domain",
+    "crates/relay-jitter",
+    "crates/relay-opus",
+    "crates/relay-opus-sys",
+    "crates/relay-protocol",
+    "crates/relay-resample",
+    "crates/relay-rt",
+    "crates/relay-session",
+    "crates/relay-testkit",
+    "crates/relay-transport",
+    "apps/connect",
+    "apps/stream",
+    "apps/link",
+]
+exclude = ["apps/plugin"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.92"
+license = "MPL-2.0"
+
+[workspace.dependencies]
+prost = "=0.14.4"
+rtrb = "=0.3.4"
+rubato = "=4.0.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"

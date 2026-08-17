@@ -1,0 +1,18 @@
+---
+const name = Astro.url.searchParams.get("n") ?? "session";
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RELAY · {name}</title>
+    <meta http-equiv="refresh" content={`0;url=https://relay.matari-audio.com/${name}`} />
+  </head>
+  <body>
+    <p>Opening {name}…</p>
+    <p>
+      <a href={`https://relay.matari-audio.com/${name}`}>Continue</a>
+    </p>
+  </body>
+</html>

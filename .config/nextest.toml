@@ -1,0 +1,12 @@
+[profile.default]
+retries = 0
+fail-fast = true
+status-level = "pass"
+final-status-level = "flaky"
+
+[profile.ci]
+retries = 2
+fail-fast = false
+status-level = "retry"
+final-status-level = "fail"
+junit = { path = "junit.xml" }

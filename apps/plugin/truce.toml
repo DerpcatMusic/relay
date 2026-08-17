@@ -1,0 +1,20 @@
+[vendor]
+name = "Matari Audio"
+id = "com.matari.audio"
+url = "https://matari-audio.com"
+au_manufacturer = "Mtri"
+
+[[plugin]]
+name = "RELAY"
+bundle_id = "relay"
+crate = "relay-plugin"
+category = "effect"
+fourcc = "RlyP"
+au3_subtype = "RlP3"
+au_tag = "Effects"
+vst3_subcategory = "Tools"
+au3_name = "RELAY (AUv3)"
+description = """
+Matari Audio RELAY — low-latency DAW-to-DAW connect and unpaid listen. \
+No subscription or paid TURN path.
+"""

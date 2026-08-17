@@ -1,0 +1,13 @@
+[files]
+extend-exclude = [
+  ".git/",
+  "node_modules/",
+  "target/",
+  "pnpm-lock.yaml",
+  "packages/protocol/src/generated/",
+]
+
+[default]
+extend-ignore-re = ["ded5c06cf"]
+
+[default.extend-words]

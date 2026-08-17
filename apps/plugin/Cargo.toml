@@ -1,0 +1,52 @@
+[package]
+name = "relay-plugin"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MPL-2.0"
+publish = false
+description = "RELAY Connect / Stream DAW plugin (Truce shell)"
+
+[workspace]
+resolver = "3"
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[[bin]]
+name = "relay-plugin-standalone"
+path = "src/main.rs"
+required-features = ["standalone"]
+
+[features]
+default = ["clap", "vst3", "standalone"]
+clap = ["dep:truce-clap", "dep:clap-sys", "truce/clap"]
+vst3 = ["dep:truce-vst3", "truce/vst3"]
+lv2 = ["dep:truce-lv2", "truce/lv2"]
+standalone = ["dep:truce-standalone"]
+shell = ["truce/shell"]
+rt-paranoid = ["truce/rt-paranoid"]
+
+[dependencies]
+relay-audio = { version = "=0.1.0", path = "../../crates/relay-audio" }
+relay-session = { version = "=0.1.0", path = "../../crates/relay-session" }
+truce = { path = "../../../truce-derpcat/crates/truce", default-features = false }
+truce-core = { path = "../../../truce-derpcat/crates/truce-core" }
+truce-params = { path = "../../../truce-derpcat/crates/truce-params" }
+truce-clap = { path = "../../../truce-derpcat/crates/truce-clap", optional = true }
+truce-vst3 = { path = "../../../truce-derpcat/crates/truce-vst3", optional = true }
+truce-lv2 = { path = "../../../truce-derpcat/crates/truce-lv2", optional = true }
+clap-sys = { version = "0.5", optional = true }
+truce-standalone = { path = "../../../truce-derpcat/crates/truce-standalone", features = ["gui"], optional = true }
+truce-font = { path = "../../../truce-derpcat/crates/truce-font" }
+truce-loader = { path = "../../../truce-derpcat/crates/truce-loader" }
+truce-egui = { path = "../../../truce-derpcat/crates/truce-egui" }
+egui = "0.35"
+plugcat = { path = "../../../plugcat/crates/plugcat", default-features = false, features = ["egui-035"] }
+ureq = "2.12"
+tungstenite = { version = "0.26", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
+open = "5"
+
+[dev-dependencies]
+truce-test = { path = "../../../truce-derpcat/crates/truce-test" }
