@@ -16,7 +16,7 @@ use relay_session::{
 use truce::prelude::*;
 use truce_egui::EguiEditor;
 
-use editor::{RelayUi, buffr_visuals};
+use editor::{RelayUi, buffr_visuals, install_chrome};
 
 use RelayParamsParamId as P;
 
@@ -322,6 +322,12 @@ impl PluginLogic for RelayPlugin {
     ) -> ProcessStatus {
         params.control.set_linked(params.link.value());
         params.control.set_web_wanted(true);
+        if let Ok(session) = params.session.read() {
+            let name = normalize_slug(&session.name);
+            if !name.is_empty() {
+                let _ = params.control.set_session_name(name);
+            }
+        }
         params.control.set_role(params.product.value().role());
         params.control.set_codec(params.codec.value().wire());
         params
@@ -398,6 +404,7 @@ impl PluginLogic for RelayPlugin {
                 .resizable(true)
                 .min_size((MIN_WINDOW_W, MIN_WINDOW_H))
                 .max_size((MAX_WINDOW_W, MAX_WINDOW_H))
+                .with_context_setup(install_chrome)
                 .with_visuals(buffr_visuals()),
         )
     }

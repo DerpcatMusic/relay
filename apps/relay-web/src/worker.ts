@@ -78,6 +78,7 @@ export class SessionRoom extends DurableObject {
         }
       } else {
         server.serializeAttachment({ silent: this.silent });
+        this.askHostForListeners();
       }
       this.broadcastText(await this.roomEvent());
       return new Response(null, { status: 101, webSocket: pair[0] });
@@ -276,6 +277,18 @@ export class SessionRoom extends DurableObject {
       } catch {
         /* host gone */
       }
+    }
+  }
+
+  /// Listeners that opened `/out` before the plugin `/in` socket still need an
+  /// offer. The original `want` was sent into an empty host set and dropped.
+  private askHostForListeners(): void {
+    for (const peer of this.ctx.getWebSockets("out")) {
+      const att = peer.deserializeAttachment() as { id?: string; ok?: boolean } | null;
+      if (!att?.ok || !att.id) {
+        continue;
+      }
+      this.tellHost(JSON.stringify({ t: "want", id: att.id }));
     }
   }
 
@@ -518,7 +531,7 @@ function listenPage(name: string, landing: boolean): string {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="relay-listen" content="9">
+<meta name="relay-listen" content="12">
 <meta name="theme-color" content="#191919">
 <title>${landing ? "RELAY" : `RELAY · ${name}`}</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -1027,6 +1040,14 @@ function onCtrl(raw) {
     if (typeof msg.peak === 'number') {
       pluginPeak = msg.peak;
       setMeterPeak(msg.peak);
+      if (msg.peak > 0.002 && (lastRoom.silent || lastRoom.asleep)) {
+        lastRoom.silent = false;
+        lastRoom.asleep = false;
+        lastRoom.live = true;
+        lastRoom.host = true;
+        log('host audio');
+        kickPlayback();
+      }
     }
     const key = String(msg.ready) + ':' + Math.floor(Number(msg.sent) / 50) + ':' + (msg.peak > 0.002 ? 'hot' : 'quiet');
     if (key !== lastStatLog) {
@@ -1037,6 +1058,7 @@ function onCtrl(raw) {
     return;
   }
   if (msg.t === 'room') {
+    const hadHost = lastRoom.host;
     lastRoom = {
       host: !!msg.host,
       live: !!msg.live,
@@ -1049,6 +1071,7 @@ function onCtrl(raw) {
     };
     if (msg.asleep || msg.silent) dtxMode = true;
     log(msg.host ? (msg.silent ? 'host silent' : 'host on') : 'no host');
+    if (lastRoom.host && !hadHost) requestOffer('host on');
     renderWho();
     if (msg.claim) {
       maybeLan(msg.claim);
@@ -1079,7 +1102,7 @@ function onCtrl(raw) {
     lastRoom.live = true;
     lastRoom.host = true;
     log('host audio');
-    renderWho();
+    kickPlayback();
     return;
   }
   if (msg.t === 'cfg') {
@@ -1094,6 +1117,11 @@ function onCtrl(raw) {
   if (msg.t === 'offer' && msg.sdp) {
     log('offer ' + sdpSummary(msg.sdp));
     if (pc && pc.remoteDescription) {
+      const ice = pc.iceConnectionState;
+      if (ice !== 'failed' && ice !== 'closed') {
+        log('offer ignored — ice ' + ice);
+        return;
+      }
       log('new offer — reset peer');
       dropPc();
     }
@@ -1103,7 +1131,7 @@ function onCtrl(raw) {
   }
   if (msg.t === 'ice' && msg.cand) {
     log('host ice ' + iceKind(msg.cand));
-    const cand = { candidate: msg.cand, sdpMid: msg.mid || '0', sdpMLineIndex: 0 };
+    const cand = { candidate: msg.cand, sdpMid: msg.mid || '0' };
     if (pc && pc.remoteDescription) {
       pc.addIceCandidate(cand).catch(() => { log('ice dropped'); });
     } else {
@@ -1129,7 +1157,17 @@ let pluginPeak = 0;
 let lastStatLog = '';
 let offerWatch = 0;
 let wantLock = 0;
+let takingOffer = false;
 const speaker = document.getElementById('spkr');
+function kickPlayback() {
+  speaker.muted = false;
+  if (speaker.srcObject) {
+    const tracks = speaker.srcObject.getAudioTracks ? speaker.srcObject.getAudioTracks() : [];
+    for (let i = 0; i < tracks.length; i++) tracks[i].enabled = true;
+    speaker.play().catch(() => {});
+  }
+  renderWho();
+}
 function hasRemote() {
   return !!(pc && pc.remoteDescription);
 }
@@ -1138,6 +1176,10 @@ function sendWant(reason) {
   if (!socket || socket.readyState !== 1) return false;
   try { socket.send(JSON.stringify({ t: 'want' })); } catch (e) { return false; }
   return true;
+}
+function sendBye() {
+  if (!socket || socket.readyState !== 1) return;
+  try { socket.send(JSON.stringify({ t: 'bye' })); } catch (e) {}
 }
 function armOfferWatch() {
   clearTimeout(offerWatch);
@@ -1150,7 +1192,13 @@ function requestOffer(reason) {
   const now = Date.now();
   if (now - wantLock < 800) return;
   wantLock = now;
-  dropPc();
+  const retry = reason === 'ice failed' || reason === 'ice stuck' || reason === 'peer failed' || reason === 'peer stuck';
+  if (retry) {
+    dropPc();
+    sendBye();
+  } else if (hasRemote() || pendingOffer || pc) {
+    return;
+  }
   sendWant(reason);
   armOfferWatch();
 }
@@ -1298,38 +1346,43 @@ function ensurePc() {
     socket.send(JSON.stringify({ t: 'ice', cand: ev.candidate.candidate, mid: ev.candidate.sdpMid }));
   };
   pc.oniceconnectionstatechange = () => {
-    if (!pc) return;
-    log('ice ' + pc.iceConnectionState);
-    if (pc.iceConnectionState === 'failed') requestOffer('ice failed');
-    if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+    const peer = pc;
+    if (!peer) return;
+    log('ice ' + peer.iceConnectionState);
+    if (peer.iceConnectionState === 'failed') {
+      requestOffer('ice failed');
+      return;
+    }
+    if (peer.iceConnectionState === 'connected' || peer.iceConnectionState === 'completed') {
       lastRoom.live = true;
       lastRoom.host = true;
       renderWho();
     }
-    if (pc.iceConnectionState === 'disconnected') {
-      const seen = pc;
+    if (peer.iceConnectionState === 'disconnected') {
+      const seen = peer;
       setTimeout(() => {
-        if (pc === seen && pc.iceConnectionState === 'disconnected') requestOffer('ice stuck');
+        if (pc === seen && seen.iceConnectionState === 'disconnected') requestOffer('ice stuck');
       }, 8000);
     }
   };
   pc.onconnectionstatechange = () => {
     snapshotRelay();
-    if (!pc) return;
-    log('peer ' + pc.connectionState);
-    if (pc.connectionState === 'disconnected') {
-      const seen = pc;
+    const peer = pc;
+    if (!peer) return;
+    log('peer ' + peer.connectionState);
+    if (peer.connectionState === 'disconnected') {
+      const seen = peer;
       setTimeout(() => {
-        if (pc === seen && pc.connectionState === 'disconnected') requestOffer('peer stuck');
+        if (pc === seen && seen.connectionState === 'disconnected') requestOffer('peer stuck');
       }, 8000);
       return;
     }
-    if (pc.connectionState === 'failed') {
+    if (peer.connectionState === 'failed') {
       requestOffer('peer failed');
       return;
     }
-    if (pc.connectionState === 'connected' || pc.connectionState === 'connecting') {
-      lastRoom.live = pc.connectionState === 'connected';
+    if (peer.connectionState === 'connected' || peer.connectionState === 'connecting') {
+      lastRoom.live = peer.connectionState === 'connected';
       lastRoom.host = true;
       renderWho();
     }
@@ -1342,6 +1395,7 @@ function dropPc() {
   pc = null;
   pendingOffer = null;
   pendingIce = [];
+  takingOffer = false;
   hooked = false;
   analyserL = null;
   analyserR = null;
@@ -1355,23 +1409,29 @@ function dropPc() {
 }
 async function acceptOffer(sdp) {
   clearTimeout(offerWatch);
-  const peer = ensurePc();
-  if (peer.remoteDescription) return;
-  await peer.setRemoteDescription({ type: 'offer', sdp: forceOpusStereo(sdp) });
-  pendingOffer = null;
-  const held = pendingIce.splice(0);
-  log('answer + ' + held.length + ' held ice');
-  for (let i = 0; i < held.length; i++) {
-    peer.addIceCandidate(held[i]).catch(() => {});
+  if (takingOffer) return;
+  takingOffer = true;
+  try {
+    const peer = ensurePc();
+    if (peer.remoteDescription) return;
+    await peer.setRemoteDescription({ type: 'offer', sdp: forceOpusStereo(sdp) });
+    pendingOffer = null;
+    const held = pendingIce.splice(0);
+    log('answer + ' + held.length + ' held ice');
+    for (let i = 0; i < held.length; i++) {
+      peer.addIceCandidate(held[i]).catch(() => {});
+    }
+    const answer = await peer.createAnswer();
+    answer.sdp = forceOpusStereo(answer.sdp);
+    await peer.setLocalDescription(answer);
+    log('answer ' + sdpSummary(answer.sdp));
+    if (socket && socket.readyState === 1) {
+      socket.send(JSON.stringify({ t: 'answer', sdp: answer.sdp }));
+    }
+    snapshotRelay();
+  } finally {
+    takingOffer = false;
   }
-  const answer = await peer.createAnswer();
-  answer.sdp = forceOpusStereo(answer.sdp);
-  await peer.setLocalDescription(answer);
-  log('answer ' + sdpSummary(answer.sdp));
-  if (socket && socket.readyState === 1) {
-    socket.send(JSON.stringify({ t: 'answer', sdp: answer.sdp }));
-  }
-  snapshotRelay();
 }
 async function armAudio() {
   armed = true;
@@ -1388,7 +1448,12 @@ async function armAudio() {
   if (ctx && ctx.state === 'suspended') {
     ctx.resume().catch(() => {});
   }
-  if (speaker.srcObject) wirePlayback(speaker.srcObject);
+  if (speaker.srcObject) {
+    const tracks = speaker.srcObject.getAudioTracks ? speaker.srcObject.getAudioTracks() : [];
+    for (let i = 0; i < tracks.length; i++) tracks[i].enabled = true;
+    speaker.muted = false;
+    wirePlayback(speaker.srcObject);
+  }
   if (pendingOffer) {
     try {
       await acceptOffer(pendingOffer);

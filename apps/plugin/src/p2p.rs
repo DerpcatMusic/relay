@@ -41,6 +41,7 @@ struct Peer {
     ready: bool,
     dead: bool,
     answered: bool,
+    offer_sdp: Option<String>,
     pending_ice: Vec<(String, Option<String>)>,
 }
 
@@ -173,6 +174,7 @@ impl Hub {
             for event in drain_ready(peer.driver.as_mut()) {
                 match event {
                     Event::LocalDescription { description } => {
+                        peer.offer_sdp = Some(description.sdp().to_owned());
                         outgoing.push(signal_sdp("offer", &id, description.sdp()));
                     }
                     Event::LocalCandidate { candidate } => {
@@ -211,6 +213,14 @@ impl Hub {
     }
 
     fn want(&mut self, id: &str, outgoing: &mut Vec<String>) {
+        if let Some(peer) = self.peers.get(id)
+            && !peer.dead
+        {
+            if let Some(sdp) = &peer.offer_sdp {
+                outgoing.push(signal_sdp("offer", id, sdp));
+            }
+            return;
+        }
         self.drop_peer(id);
         if self.peers.len() >= MAX_PEERS {
             let spare = self
@@ -241,6 +251,7 @@ impl Hub {
             ready: false,
             dead: false,
             answered: false,
+            offer_sdp: None,
             pending_ice: Vec::new(),
         };
         if peer
@@ -460,8 +471,20 @@ mod tests {
         outgoing
     }
 
+    fn offer_sdp(msgs: &[String]) -> Option<String> {
+        for msg in msgs {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(msg) else {
+                continue;
+            };
+            if value.get("t").and_then(|v| v.as_str()) == Some("offer") {
+                return value.get("sdp").and_then(|v| v.as_str()).map(str::to_owned);
+            }
+        }
+        None
+    }
+
     #[test]
-    fn want_on_existing_id_replaces() {
+    fn want_on_existing_id_keeps_peer() {
         let mut hub = Hub::new();
         let mut outgoing = Vec::new();
         hub.apply_signal(r#"{"t":"want","id":"ab"}"#, &mut outgoing);
@@ -471,17 +494,38 @@ mod tests {
             "libdatachannel must create a peer from want"
         );
         let first = wait_offer(&mut hub);
-        assert!(
-            first.iter().any(|msg| msg.contains("\"t\":\"offer\"")),
-            "first want must emit an offer: {first:?}"
-        );
+        let sdp = offer_sdp(&first).expect("first want must emit an offer");
         outgoing.clear();
         hub.apply_signal(r#"{"t":"want","id":"ab"}"#, &mut outgoing);
         assert_eq!(hub.peer_count(), 1);
+        assert_eq!(
+            offer_sdp(&outgoing).as_deref(),
+            Some(sdp.as_str()),
+            "duplicate want must re-send the same offer, not a new peer: {outgoing:?}"
+        );
+    }
+
+    #[test]
+    fn bye_then_want_creates_a_fresh_peer() {
+        let mut hub = Hub::new();
+        let mut outgoing = Vec::new();
+        hub.apply_signal(r#"{"t":"want","id":"ab"}"#, &mut outgoing);
+        let first = wait_offer(&mut hub);
+        let first_sdp = offer_sdp(&first).expect("first offer");
+        outgoing.clear();
+        hub.apply_all(
+            &[
+                r#"{"t":"bye","id":"ab"}"#.to_owned(),
+                r#"{"t":"want","id":"ab"}"#.to_owned(),
+            ],
+            &mut outgoing,
+        );
+        assert_eq!(hub.peer_count(), 1);
         let second = wait_offer(&mut hub);
-        assert!(
-            second.iter().any(|msg| msg.contains("\"t\":\"offer\"")),
-            "replaced want must emit an offer: {second:?}"
+        let second_sdp = offer_sdp(&second).expect("bye+want must emit a new offer");
+        assert_ne!(
+            first_sdp, second_sdp,
+            "bye must drop the old ICE credentials"
         );
     }
 

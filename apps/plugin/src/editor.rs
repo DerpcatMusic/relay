@@ -26,6 +26,10 @@ const HEADER_H: f32 = 44.0;
 
 const BARLOW: &[u8] = include_bytes!("../assets/fonts/Barlow-SemiBold.ttf");
 const BARLOW_BLACK: &[u8] = include_bytes!("../assets/fonts/Barlow-Black.ttf");
+const FONT_BARLOW: &str = "barlow";
+const FONT_BARLOW_BLACK: &str = "barlow-black";
+const FONT_JETBRAINS: &str = "jetbrains";
+const FONT_PHOSPHOR: &str = "phosphor-regular";
 
 /// BUFFR Studio Blue — same tokens as drop-recorder `themes.json`.
 const BG: egui::Color32 = egui::Color32::from_rgb(25, 25, 25);
@@ -62,7 +66,6 @@ pub struct RelayUi {
     hold_age_r: f32,
     last_h: u32,
     overlay: Overlay,
-    chrome: bool,
 }
 
 impl RelayUi {
@@ -78,7 +81,6 @@ impl RelayUi {
             hold_age_r: 0.0,
             last_h: window_h,
             overlay: Overlay::None,
-            chrome: false,
         }
     }
 }
@@ -110,10 +112,7 @@ impl EditorUi<RelayParams> for RelayUi {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, ctx: &PluginContext<RelayParams>) {
-        if !self.chrome {
-            install_chrome(ui.ctx());
-            self.chrome = true;
-        }
+        install_chrome(ui.ctx());
         apply_buffr_spacing(ui);
         let snap = ctx.params().control.snapshot();
         let linked = ctx.params().link.value();
@@ -338,37 +337,63 @@ pub fn buffr_visuals() -> egui::Visuals {
     visuals
 }
 
-fn install_chrome(ctx: &egui::Context) {
+/// Install named font families and SVG loaders before the first `Ui` layout.
+///
+/// Call from `EguiEditor::with_context_setup` so the font atlas exists when
+/// the wgpu renderer first uploads textures. Calling `ctx.set_fonts` inside
+/// `EditorUi::ui` rebuilds the atlas mid-frame and leaves the editor blank.
+pub(crate) fn install_chrome(ctx: &egui::Context) {
+    let id = egui::Id::new("relay_chrome_initialized");
+    if ctx.data(|data| data.get_temp::<bool>(id).unwrap_or(false)) {
+        return;
+    }
+    ctx.set_fonts(font_definitions());
     egui_extras::install_image_loaders(ctx);
+    ctx.data_mut(|data| data.insert_temp(id, true));
+}
+
+fn font_definitions() -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
-        "barlow".to_owned(),
+        FONT_BARLOW.into(),
         Arc::new(egui::FontData::from_static(BARLOW)),
     );
     fonts.font_data.insert(
-        "barlow-black".to_owned(),
+        FONT_BARLOW_BLACK.into(),
         Arc::new(egui::FontData::from_static(BARLOW_BLACK)),
     );
     fonts.font_data.insert(
-        "jetbrains".to_owned(),
+        FONT_JETBRAINS.into(),
         Arc::new(egui::FontData::from_static(JETBRAINS_MONO)),
     );
     fonts
         .families
         .entry(egui::FontFamily::Proportional)
         .or_default()
-        .insert(0, "barlow".to_owned());
+        .insert(0, FONT_BARLOW.into());
     fonts
         .families
         .entry(egui::FontFamily::Monospace)
         .or_default()
-        .insert(0, "jetbrains".to_owned());
+        .insert(0, FONT_JETBRAINS.into());
     fonts.families.insert(
-        egui::FontFamily::Name("relay-black".into()),
-        vec!["barlow-black".to_owned()],
+        egui::FontFamily::Name(FONT_BARLOW_BLACK.into()),
+        vec![FONT_BARLOW_BLACK.to_owned(), FONT_BARLOW.to_owned()],
+    );
+    fonts.font_data.insert(
+        FONT_PHOSPHOR.into(),
+        Arc::new(egui_phosphor::Variant::Regular.font_data()),
+    );
+    fonts.families.insert(
+        egui::FontFamily::Name(FONT_PHOSPHOR.into()),
+        vec![FONT_PHOSPHOR.into()],
     );
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
-    ctx.set_fonts(fonts);
+    fonts
+}
+
+fn phosphor_family() -> egui::FontFamily {
+    egui::FontFamily::Name(FONT_PHOSPHOR.into())
 }
 
 fn apply_buffr_spacing(ui: &mut egui::Ui) {
@@ -385,7 +410,7 @@ fn relay_logo(ui: &mut egui::Ui) -> egui::Response {
         paint_matari_mark(ui, egui::vec2(26.0, 16.0));
         ui.label(
             egui::RichText::new("RELAY")
-                .family(egui::FontFamily::Name("relay-black".into()))
+                .family(egui::FontFamily::Name(FONT_BARLOW_BLACK.into()))
                 .size(18.0)
                 .color(TEXT)
                 .extra_letter_spacing(1.4),
@@ -749,7 +774,12 @@ fn session_row(ui: &mut egui::Ui, state: &mut RelayUi, ctx: &PluginContext<Relay
 fn password_row(ui: &mut egui::Ui, state: &mut RelayUi, ctx: &PluginContext<RelayParams>) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
-        ui.label(egui::RichText::new(ph::LOCK_SIMPLE).size(16.0).color(MUTED));
+        ui.label(
+            egui::RichText::new(ph::LOCK_SIMPLE)
+                .family(phosphor_family())
+                .size(16.0)
+                .color(MUTED),
+        );
         let response = ui.add(
             egui::TextEdit::singleline(&mut state.pass_buf)
                 .password(true)
@@ -846,10 +876,15 @@ fn codec_summary(ctx: &PluginContext<RelayParams>, codec: Codec) -> String {
 
 fn icon_btn(ui: &mut egui::Ui, glyph: &str, tip: &str) -> egui::Response {
     ui.add(
-        egui::Button::new(egui::RichText::new(glyph).size(16.0).color(TEXT))
-            .fill(LANE)
-            .corner_radius(4.0)
-            .min_size(egui::vec2(28.0, 28.0)),
+        egui::Button::new(
+            egui::RichText::new(glyph)
+                .family(phosphor_family())
+                .size(16.0)
+                .color(TEXT),
+        )
+        .fill(LANE)
+        .corner_radius(4.0)
+        .min_size(egui::vec2(28.0, 28.0)),
     )
     .on_hover_text(tip)
     .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -1072,9 +1107,36 @@ fn pipe_copy(bin: &str, args: &[&str], value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use relay_session::{
         ConnectionState, SessionRole, SessionView, classify_session, format_session_status,
     };
+
+    #[test]
+    fn named_families_resolve_to_registered_data() {
+        let fonts = font_definitions();
+        for key in [FONT_BARLOW, FONT_BARLOW_BLACK, FONT_JETBRAINS, FONT_PHOSPHOR] {
+            assert!(
+                fonts.font_data.contains_key(key),
+                "font data missing for {key}"
+            );
+        }
+        let black = fonts
+            .families
+            .get(&egui::FontFamily::Name(FONT_BARLOW_BLACK.into()))
+            .expect("barlow-black family");
+        assert!(black.contains(&FONT_BARLOW.to_owned()));
+        let phosphor = fonts
+            .families
+            .get(&phosphor_family())
+            .expect("phosphor family");
+        assert_eq!(phosphor.first().map(String::as_str), Some(FONT_PHOSPHOR));
+        let proportional = fonts
+            .families
+            .get(&egui::FontFamily::Proportional)
+            .expect("proportional family");
+        assert_eq!(proportional.first().map(String::as_str), Some(FONT_BARLOW));
+    }
 
     fn view(silent: bool, web: u32) -> SessionView {
         SessionView {

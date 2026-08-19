@@ -439,7 +439,7 @@ document.getElementById('go').onclick = async () => {{
         try {{
           const m = JSON.parse(ev.data);
           if (m.t === 'dtx') {{ resume = true; room.live = false; who.textContent = 'Asleep'; }}
-          if (m.t === 'go') {{ room.live = true; show(); }}
+          if (m.t === 'go') {{ room.live = true; resume = true; show(); }}
           if (m.t === 'room' || m.t === 'stat') {{
             room.host = m.host !== false;
             room.live = !!m.live;

@@ -26,8 +26,14 @@ test("offer is answered without waiting for Listen", () => {
   assert.doesNotMatch(src, /if \(ctx\) acceptOffer/);
 });
 
-test("page advertises listen revision 9", () => {
-  assert.match(src, /name="relay-listen" content="9"/);
+test("page advertises listen revision 12", () => {
+  assert.match(src, /name="relay-listen" content="12"/);
+});
+
+test("host joining a waiting listener is asked for an offer", () => {
+  assert.match(src, /askHostForListeners\(\)/);
+  assert.match(src, /private askHostForListeners/);
+  assert.match(src, /requestOffer\('host on'\)/);
 });
 
 test("meters are flat GYR rails without analog LED notches", () => {
@@ -46,12 +52,42 @@ test("listen page meters from plugin peak stats", () => {
   assert.match(src, /setMeterPeak\(msg\.peak\)/);
 });
 
+test("go and a hot peak kick playback instead of waiting on the jitter buffer", () => {
+  assert.match(src, /function kickPlayback/);
+  assert.match(src, /msg\.t === 'go'[\s\S]*kickPlayback\(\)/);
+  assert.match(src, /msg\.peak > 0\.002[\s\S]*kickPlayback\(\)/);
+});
+
 test("disconnected is not treated as a fatal connection failure", () => {
   assert.equal(src.includes("Connection failed"), false);
   assert.match(src, /connectionState === 'disconnected'/);
   assert.match(src, /requestOffer\('ice failed'\)/);
   assert.match(src, /requestOffer\('ice stuck'\)/);
   assert.doesNotMatch(src, /iceConnectionState === 'disconnected'\) bounceSocket/);
+});
+
+test("a second offer does not reset ICE that is still checking", () => {
+  assert.match(src, /offer ignored/);
+  assert.match(src, /ice !== 'failed'/);
+  assert.match(src, /ice !== 'closed'/);
+});
+
+test("ice-failed handler captures the peer before tearing it down", () => {
+  assert.match(src, /const peer = pc;/);
+  assert.match(src, /peer\.iceConnectionState === 'failed'/);
+  assert.match(src, /requestOffer\('ice failed'\);\s*return;/);
+});
+
+test("a retry want hangs up the old pair before asking again", () => {
+  assert.match(src, /function sendBye/);
+  assert.match(src, /dropPc\(\);\s*sendBye\(\);/);
+  assert.match(src, /t: 'bye'/);
+});
+
+test("host-on want does not drop an in-flight peer", () => {
+  const request = src.slice(src.indexOf("function requestOffer"), src.indexOf("const cap"));
+  assert.match(request, /retry/);
+  assert.doesNotMatch(request, /wantLock = now;\s*dropPc\(\);\s*sendWant/);
 });
 
 test("missing offer asks the host again without closing signaling", () => {

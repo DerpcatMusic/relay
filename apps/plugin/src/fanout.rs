@@ -3,6 +3,7 @@
 
 use std::collections::VecDeque;
 use std::io;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -13,6 +14,7 @@ use relay_session::{
     CodecSettings, PUBLIC_LINK_ORIGIN, SessionControl, SessionRole, WIRE_BITS, local_ipv4_addrs,
     normalize_slug,
 };
+use tungstenite::client::IntoClientRequest;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
@@ -60,8 +62,44 @@ const FADE_SAMPLES: usize = WEB_BATCH_SAMPLES;
 const HANGOVER_FRAMES: u32 = 20;
 /// Protocol pings keep the Cloudflare `/in` socket from being dropped idle.
 const PING_EVERY: Duration = Duration::from_secs(12);
+/// Per-address TCP timeout. `tungstenite::connect` has none, so a black-holed
+/// IPv6 (common on Linux DAW hosts) stalls the fan-out thread and the listen
+/// page sits on `want no offer` until the OS gives up.
+const CONNECT_WAIT: Duration = Duration::from_secs(2);
 /// Host-callback starvation (DAW suspended / no PCM) after this many empty takes.
 const STARVE_EMPTY: u32 = 12;
+/// Keep the Opus RTP clock ticking while the DAW is stopped so browsers
+/// do not rebuild a ~2 s jitter buffer on resume.
+const RTP_KEEP_EVERY: Duration = Duration::from_millis(20);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MediaEdge {
+    Speak,
+    Resume,
+    HoldStart,
+    KeepAlive,
+    Idle,
+}
+
+fn media_edge(held: bool, has_pcm: bool, empty_runs: u32, has_listeners: bool) -> MediaEdge {
+    if has_pcm {
+        return if held {
+            MediaEdge::Resume
+        } else {
+            MediaEdge::Speak
+        };
+    }
+    if !has_listeners {
+        return MediaEdge::Idle;
+    }
+    if held {
+        MediaEdge::KeepAlive
+    } else if empty_runs >= STARVE_EMPTY {
+        MediaEdge::HoldStart
+    } else {
+        MediaEdge::Idle
+    }
+}
 
 fn run(control: Arc<SessionControl>, stop: Arc<AtomicBool>) {
     let hub = LocalHub::start(Arc::clone(&control), Arc::clone(&stop));
@@ -72,7 +110,6 @@ fn run(control: Arc<SessionControl>, stop: Arc<AtomicBool>) {
         .build();
     let mut last_claim = String::new();
     let mut last_cfg = String::new();
-    let mut seq = 0_u32;
     let mut lan_seq = 0_u32;
     let mut socket: Option<CloudSocket> = None;
     let mut last_ws_try = Instant::now()
@@ -92,6 +129,10 @@ fn run(control: Arc<SessionControl>, stop: Arc<AtomicBool>) {
         .checked_sub(Duration::from_secs(1))
         .unwrap_or_else(Instant::now);
     let mut last_stat = String::new();
+    let mut last_keep = Instant::now()
+        .checked_sub(RTP_KEEP_EVERY)
+        .unwrap_or_else(Instant::now);
+    let silence = vec![0.0_f32; WEB_BATCH_SAMPLES];
     while !stop.load(Ordering::Acquire) {
         let lan_n = hub.prune_and_count();
         control.set_lan_listeners(lan_n);
@@ -214,56 +255,87 @@ fn run(control: Arc<SessionControl>, stop: Arc<AtomicBool>) {
             control.set_web_listeners(0);
         }
         let wake = control.take_web_wake();
+        let has_out = listeners > 0 || lan_n > 0;
         match control.take_pcm_live(WEB_BATCH_SAMPLES, KEEP_SAMPLES) {
             Ok(pcm) if pcm.len() >= 480 => {
                 empty_runs = 0;
-                let Some(outgoing) = delay.push(pcm) else {
+                let resume = dtx.held || wake;
+                let outgoing = if resume {
+                    delay.clear();
+                    tell_live(&mut socket, &hub, true);
+                    dtx.force_wake();
+                    fader = Fader::default();
+                    pcm
+                } else if let Some(frame) = delay.push(pcm) {
+                    frame
+                } else {
                     continue;
                 };
                 remember_tail(&outgoing, &mut last_l, &mut last_r);
-                if lan_n > 0 {
-                    lan_seq = lan_seq.wrapping_add(1);
-                    hub.broadcast_bin(&encode_frame(lan_seq, &outgoing));
-                }
+                emit_pcm(
+                    &hub,
+                    lan_n,
+                    &mut lan_seq,
+                    &mut p2p,
+                    listeners,
+                    control.web_wanted(),
+                    &outgoing,
+                    control.bitrate_kbps(),
+                );
                 if listeners == 0 || !control.web_wanted() {
                     dtx = Dtx::default();
                     fader = Fader::default();
-                    control.set_web_silent(false);
-                } else {
-                    p2p.push_pcm(&outgoing, control.bitrate_kbps());
-                    control.set_web_silent(false);
                 }
+                control.set_web_silent(false);
                 control.set_web_ok(socket.is_some());
             }
             _ => {
-                empty_runs = empty_runs.saturating_add(1);
-                if listeners > 0
-                    && control.web_wanted()
-                    && empty_runs >= STARVE_EMPTY
-                    && !dtx.held
-                    && (last_l.abs() > SILENCE_PEAK
-                        || last_r.abs() > SILENCE_PEAK
-                        || !dtx.is_idle())
-                {
-                    let mut outgoing = fade_from_last(last_l, last_r);
-                    last_l = 0.0;
-                    last_r = 0.0;
-                    fader.start_out();
-                    fader.apply(&mut outgoing);
-                    send_pcm(&mut socket, &mut seq, &outgoing);
-                    if let Some(ws) = socket.as_mut() {
-                        let _ = send_keep(ws, Message::Text(r#"{"t":"dtx"}"#.into()));
-                    }
-                    dtx.phase = DtxPhase::Held;
-                    dtx.held = true;
-                    dtx.silent_run = HANGOVER_FRAMES;
-                    control.set_web_silent(true);
-                } else if wake && dtx.held {
+                if wake && dtx.held {
                     dtx.force_wake();
-                    if let Some(ws) = socket.as_mut() {
-                        let _ = send_keep(ws, Message::Text(r#"{"t":"go"}"#.into()));
-                    }
+                    empty_runs = 0;
+                    tell_live(&mut socket, &hub, true);
                     control.set_web_silent(false);
+                }
+                empty_runs = empty_runs.saturating_add(1);
+                let edge = media_edge(dtx.held, false, empty_runs, has_out);
+                match edge {
+                    MediaEdge::HoldStart => {
+                        let mut outgoing = fade_from_last(last_l, last_r);
+                        last_l = 0.0;
+                        last_r = 0.0;
+                        fader.start_out();
+                        fader.apply(&mut outgoing);
+                        emit_pcm(
+                            &hub,
+                            lan_n,
+                            &mut lan_seq,
+                            &mut p2p,
+                            listeners,
+                            control.web_wanted(),
+                            &outgoing,
+                            control.bitrate_kbps(),
+                        );
+                        tell_live(&mut socket, &hub, false);
+                        dtx.phase = DtxPhase::Held;
+                        dtx.held = true;
+                        dtx.silent_run = HANGOVER_FRAMES;
+                        control.set_web_silent(true);
+                        last_keep = Instant::now();
+                    }
+                    MediaEdge::KeepAlive if last_keep.elapsed() >= RTP_KEEP_EVERY => {
+                        emit_pcm(
+                            &hub,
+                            lan_n,
+                            &mut lan_seq,
+                            &mut p2p,
+                            listeners,
+                            control.web_wanted(),
+                            &silence,
+                            control.bitrate_kbps(),
+                        );
+                        last_keep = Instant::now();
+                    }
+                    _ => {}
                 }
                 let mut inbound = Vec::new();
                 if !keep_socket(
@@ -595,6 +667,10 @@ impl DelayLine {
         self.frames.pop_front()
     }
 
+    fn clear(&mut self) {
+        self.frames.clear();
+    }
+
     fn future_silent(&self) -> bool {
         !self.frames.is_empty() && self.frames.iter().all(|frame| is_silent(frame))
     }
@@ -604,15 +680,52 @@ fn send_keep(ws: &mut CloudSocket, msg: Message) -> bool {
     match ws.send(msg) {
         Ok(()) => true,
         Err(tungstenite::Error::WriteBufferFull(_)) => true,
-        Err(tungstenite::Error::Io(err))
-            if matches!(
-                err.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
-            ) =>
-        {
-            true
-        }
+        Err(err) if io_would_block(&err) => true,
         Err(_) => false,
+    }
+}
+
+fn io_would_block(err: &tungstenite::Error) -> bool {
+    match err {
+        tungstenite::Error::Io(io) => matches!(
+            io.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+        ),
+        _ => {
+            let text = err.to_string().to_ascii_lowercase();
+            text.contains("would block") || text.contains("not ready")
+        }
+    }
+}
+
+fn tell_live(socket: &mut Option<CloudSocket>, hub: &LocalHub, live: bool) {
+    let msg = if live {
+        r#"{"t":"go"}"#
+    } else {
+        r#"{"t":"dtx"}"#
+    };
+    if let Some(ws) = socket.as_mut() {
+        let _ = send_keep(ws, Message::Text(msg.to_owned().into()));
+    }
+    hub.broadcast_text(msg);
+}
+
+fn emit_pcm(
+    hub: &LocalHub,
+    lan_n: u32,
+    lan_seq: &mut u32,
+    p2p: &mut crate::p2p::Hub,
+    listeners: u32,
+    web_wanted: bool,
+    pcm: &[f32],
+    bitrate_kbps: u32,
+) {
+    if lan_n > 0 {
+        *lan_seq = lan_seq.wrapping_add(1);
+        hub.broadcast_bin(&encode_frame(*lan_seq, pcm));
+    }
+    if listeners > 0 && web_wanted {
+        p2p.push_pcm(pcm, bitrate_kbps);
     }
 }
 
@@ -632,9 +745,37 @@ fn open_in(slug: &str) -> Option<CloudSocket> {
         .strip_prefix("https://")
         .unwrap_or(PUBLIC_LINK_ORIGIN);
     let url = format!("wss://{host}/{slug}/in");
-    let (mut ws, _) = tungstenite::connect(url).ok()?;
-    configure_socket(&mut ws);
-    Some(ws)
+    let mut request = url.into_client_request().ok()?;
+    request.headers_mut().insert(
+        tungstenite::http::header::USER_AGENT,
+        tungstenite::http::HeaderValue::from_static("Mozilla/5.0 RELAY/0.1"),
+    );
+    request.headers_mut().insert(
+        tungstenite::http::header::ORIGIN,
+        tungstenite::http::HeaderValue::from_static(PUBLIC_LINK_ORIGIN),
+    );
+    for addr in ordered_addrs(host, 443) {
+        let Ok(stream) = TcpStream::connect_timeout(&addr, CONNECT_WAIT) else {
+            continue;
+        };
+        let _ = stream.set_nodelay(true);
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+        if let Ok((mut ws, _)) = tungstenite::client_tls(request.clone(), stream) {
+            configure_socket(&mut ws);
+            return Some(ws);
+        }
+    }
+    None
+}
+
+fn ordered_addrs(host: &str, port: u16) -> Vec<SocketAddr> {
+    let mut addrs: Vec<SocketAddr> = (host, port)
+        .to_socket_addrs()
+        .map(Iterator::collect)
+        .unwrap_or_default();
+    addrs.sort_by_key(SocketAddr::is_ipv6);
+    addrs
 }
 
 fn configure_socket(ws: &mut CloudSocket) {
@@ -671,16 +812,7 @@ fn service_socket(ws: &mut CloudSocket, listeners: &mut u32, inbound: &mut Vec<S
             }
             Ok(Message::Close(_)) => return false,
             Ok(_) => {}
-            Err(tungstenite::Error::Io(err))
-                if matches!(
-                    err.kind(),
-                    io::ErrorKind::WouldBlock
-                        | io::ErrorKind::TimedOut
-                        | io::ErrorKind::Interrupted
-                ) =>
-            {
-                return true;
-            }
+            Err(err) if io_would_block(&err) => return true,
             Err(tungstenite::Error::AlreadyClosed) => return false,
             Err(_) => return false,
         }
@@ -822,6 +954,85 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "hits production relay.matari-audio.com"]
+    fn live_in_socket_receives_want_from_waiting_out() {
+        let slug = format!(
+            "want-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(1)
+        );
+        let settings = relay_session::CodecSettings::live();
+        super::claim(
+            &ureq::AgentBuilder::new()
+                .timeout(std::time::Duration::from_secs(4))
+                .user_agent("Mozilla/5.0 RELAY/diag")
+                .build(),
+            &slug,
+            17_492,
+            settings,
+            "",
+            48_000,
+            128,
+            8_787,
+        )
+        .expect("claim");
+        let host = relay_session::PUBLIC_LINK_ORIGIN
+            .strip_prefix("https://")
+            .unwrap();
+        let out_url = format!("wss://{host}/{slug}/out");
+        let (mut listener, _) = tungstenite::connect(out_url).expect("listener /out");
+        listener
+            .send(tungstenite::Message::Text(
+                r#"{"t":"want"}"#.to_owned().into(),
+            ))
+            .expect("listener want");
+        let mut socket = super::open_in(&slug).expect("host /in after waiting listener");
+        super::configure_socket(&mut socket);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        let mut inbound = Vec::new();
+        let mut listeners = 0;
+        while std::time::Instant::now() < deadline {
+            assert!(super::service_socket(
+                &mut socket,
+                &mut listeners,
+                &mut inbound
+            ));
+            if inbound.iter().any(|msg| msg.contains("\"t\":\"want\"")) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+        panic!("host /in got no want after waiting /out; inbound={inbound:?}");
+    }
+
+    #[test]
+    fn ordered_addrs_puts_ipv4_first() {
+        let addrs = super::ordered_addrs("localhost", 443);
+        let first_v6 = addrs.iter().position(std::net::SocketAddr::is_ipv6);
+        let last_v4 = addrs.iter().rposition(std::net::SocketAddr::is_ipv4);
+        if let (Some(v6), Some(v4)) = (first_v6, last_v4) {
+            assert!(
+                v4 < v6,
+                "IPv4 must be tried before IPv6 so a black hole cannot stall /in"
+            );
+        }
+    }
+
+    #[test]
+    fn io_would_block_matches_timeout_and_interrupt() {
+        let timeout =
+            tungstenite::Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"));
+        assert!(super::io_would_block(&timeout));
+        let other = tungstenite::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset",
+        ));
+        assert!(!super::io_would_block(&other));
+    }
+
+    #[test]
     fn encode_frame_has_magic_and_seq() {
         let bytes = super::encode_frame(7, &[0.0, 0.5]);
         assert_eq!(&bytes[..4], b"RLY1");
@@ -902,6 +1113,50 @@ mod tests {
         let first = delay.push(vec![0.2; 4]).expect("primed");
         assert_eq!(first[0], 0.0);
         assert!(!delay.future_silent());
+    }
+
+    #[test]
+    fn delay_line_clear_drops_stale_lookahead() {
+        let mut delay = super::DelayLine::default();
+        assert!(delay.push(vec![0.0; 4]).is_none());
+        assert!(delay.push(vec![0.1; 4]).is_none());
+        delay.clear();
+        assert!(delay.push(vec![0.9; 4]).is_none());
+        assert!(delay.push(vec![0.4; 4]).is_none());
+        let first = delay.push(vec![0.5; 4]).expect("re-primed");
+        assert_eq!(first[0], 0.9);
+    }
+
+    #[test]
+    fn media_edge_resume_is_an_event() {
+        assert_eq!(
+            super::media_edge(true, true, 0, true),
+            super::MediaEdge::Resume
+        );
+        assert_eq!(
+            super::media_edge(false, true, 0, true),
+            super::MediaEdge::Speak
+        );
+    }
+
+    #[test]
+    fn media_edge_keeps_rtp_warm_after_hold() {
+        assert_eq!(
+            super::media_edge(false, false, super::STARVE_EMPTY - 1, true),
+            super::MediaEdge::Idle
+        );
+        assert_eq!(
+            super::media_edge(false, false, super::STARVE_EMPTY, true),
+            super::MediaEdge::HoldStart
+        );
+        assert_eq!(
+            super::media_edge(true, false, super::STARVE_EMPTY + 8, true),
+            super::MediaEdge::KeepAlive
+        );
+        assert_eq!(
+            super::media_edge(true, false, 3, false),
+            super::MediaEdge::Idle
+        );
     }
 
     #[test]
