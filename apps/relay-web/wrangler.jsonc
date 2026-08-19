@@ -4,6 +4,11 @@
   "compatibility_date": "2026-08-17",
   "cache": { "enabled": true },
   "workers_dev": true,
+  "assets": {
+    "directory": "./public",
+    "html_handling": "none",
+    "not_found_handling": "none"
+  },
   "routes": [
     { "pattern": "relay.matari-audio.com", "custom_domain": true }
   ],

@@ -83,14 +83,18 @@ impl RelayUi {
             overlay: Overlay::None,
         }
     }
-}
 
-impl EditorUi<RelayParams> for RelayUi {
-    fn opened(&mut self, ctx: &PluginContext<RelayParams>) {
+    fn sync_fields_from_persist(&mut self, ctx: &PluginContext<RelayParams>) {
         if let Ok(session) = ctx.params().session.read() {
-            self.peer_buf.clone_from(&session.peer);
-            self.name_buf.clone_from(&session.name);
-            self.pass_buf.clone_from(&session.password);
+            if self.name_buf.is_empty() {
+                self.name_buf.clone_from(&session.name);
+            }
+            if self.peer_buf.is_empty() {
+                self.peer_buf.clone_from(&session.peer);
+            }
+            if self.pass_buf.is_empty() {
+                self.pass_buf.clone_from(&session.password);
+            }
         }
         if self.peer_buf.is_empty() {
             self.peer_buf = format!("127.0.0.1:{DEFAULT_CONNECT_PORT}");
@@ -101,6 +105,12 @@ impl EditorUi<RelayParams> for RelayUi {
                 session.name.clone_from(&self.name_buf);
             }
         }
+    }
+}
+
+impl EditorUi<RelayParams> for RelayUi {
+    fn opened(&mut self, ctx: &PluginContext<RelayParams>) {
+        self.sync_fields_from_persist(ctx);
         if ctx.params().product.value().is_link() {
             ctx.params().link.set_value(true);
         }
@@ -112,6 +122,9 @@ impl EditorUi<RelayParams> for RelayUi {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, ctx: &PluginContext<RelayParams>) {
+        // Headless screenshot (and any host that draws before `opened`)
+        // still needs the persist slug in the name field.
+        self.sync_fields_from_persist(ctx);
         install_chrome(ui.ctx());
         apply_buffr_spacing(ui);
         let snap = ctx.params().control.snapshot();
@@ -710,7 +723,7 @@ fn editor_view(
         web_listeners: ctx.params().control.web_listeners(),
         web_ok,
         web_silent,
-        web_wanted: true,
+        web_wanted: ctx.params().product.value().is_link(),
         bound: snap.bound,
     }
 }
@@ -1115,7 +1128,12 @@ mod tests {
     #[test]
     fn named_families_resolve_to_registered_data() {
         let fonts = font_definitions();
-        for key in [FONT_BARLOW, FONT_BARLOW_BLACK, FONT_JETBRAINS, FONT_PHOSPHOR] {
+        for key in [
+            FONT_BARLOW,
+            FONT_BARLOW_BLACK,
+            FONT_JETBRAINS,
+            FONT_PHOSPHOR,
+        ] {
             assert!(
                 fonts.font_data.contains_key(key),
                 "font data missing for {key}"

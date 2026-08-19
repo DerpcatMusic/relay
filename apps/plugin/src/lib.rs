@@ -755,6 +755,36 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "bake website editor rasters"]
+    fn bake_share_raster() {
+        truce_test::screenshot!(Plugin, "../relay-web/public/plugin-share.png")
+            .setup(|plugin| {
+                let params = plugin.params();
+                if let Ok(mut session) = params.session.write() {
+                    session.name = "big-filthy-papaya".into();
+                }
+                params.link.set_value(true);
+                params.control.set_web_ok(true);
+            })
+            .run();
+    }
+
+    #[test]
+    #[ignore = "bake website editor rasters"]
+    fn bake_join_raster() {
+        truce_test::screenshot!(Plugin, "../relay-web/public/plugin-join.png")
+            .set_param(P::Product, 1.0)
+            .setup(|plugin| {
+                let params = plugin.params();
+                if let Ok(mut session) = params.session.write() {
+                    session.peer = "big-filthy-papaya".into();
+                }
+                params.link.set_value(true);
+            })
+            .run();
+    }
+
+    #[test]
     fn splice_dry_fills_a_silent_suffix() {
         let mut out = vec![0.8; 192];
         for sample in &mut out[128..] {

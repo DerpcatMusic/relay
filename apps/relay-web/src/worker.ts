@@ -419,8 +419,11 @@ export default {
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: CORS });
     }
-    if (url.pathname === "/" || url.pathname === "/health") {
-      return html(indexHtml());
+    if (url.pathname === "/health") {
+      return new Response("ok", { headers: { "cache-control": "no-store" } });
+    }
+    if (url.pathname === "/") {
+      return html(homeHtml());
     }
     if (url.pathname === "/api/claim" && request.method === "POST") {
       const body = (await request.json()) as { name?: string; port?: number; lan?: string[]; mode?: string };
@@ -517,8 +520,127 @@ function wrapFrame(message: ArrayBuffer, nextSeq: number): { bytes: ArrayBuffer;
   return { bytes: out.buffer, seq, pcmBytes: src.byteLength };
 }
 
+const LINUX_ZIP =
+  "https://github.com/DerpcatMusic/relay/releases/latest/download/RELAY-linux.zip";
+const SOURCE_URL = "https://github.com/DerpcatMusic/relay";
+const LICENSE_URL = "https://github.com/DerpcatMusic/relay/blob/main/LICENSE";
+const MATARI_MARK =
+  '<svg class="mark" viewBox="0 0 2408 1488" aria-hidden="true"><path fill="#fff" d="M99.021 1486.974c-53.202.013-96.36-43.07-96.439-96.273C2.179 1122.129 1.048 366.891.645 97.561.606 71.902 10.797 47.286 28.962 29.162 47.126 11.039 71.765.904 97.424 1c69.143.26 159.026.597 212.615.799 29.175.109 56.732 13.423 74.949 36.212 86.302 107.957 344.363 430.771 467.706 585.064 17.097 21.388 42.482 34.497 69.819 36.057 27.337 1.559 54.048-8.578 73.466-27.882 155.807-154.885 504.705-501.721 606.179-602.595 18.054-17.947 42.472-28.026 67.928-28.038 44.951-.022 118.986-.057 173.583-.084 41.56-.02 78.456 26.593 91.552 66.036 75.96 228.788 328.628 989.806 429.472 1293.541 9.759 29.393 4.804 61.685-13.319 86.8-18.123 25.115-47.207 39.995-78.178 39.998-256.183.023-811.251.072-1038.748.093-16.809.001-31.963-10.123-38.396-25.652-6.433-15.529-2.878-33.404 9.007-45.29 59.457-59.456 141.243-141.242 183.755-183.754 18.081-18.081 42.604-28.24 68.174-28.24 56.829-.002 163.744-.005 250.405-.008 30.989-.001 60.088-14.896 78.21-40.034 18.121-25.138 23.056-57.454 13.262-86.855-34.745-104.305-84.02-252.224-120.519-361.795-10.545-31.654-36.704-55.606-69.162-63.328-32.459-7.721-66.602 1.887-90.27 25.402-148.441 147.483-408.034 405.401-530.914 527.487-37.693 37.45-98.58 37.346-136.145-.232-66.869-66.892-171.554-171.613-260.274-260.363-27.571-27.58-69.041-35.836-105.073-20.918-36.031 14.919-59.528 50.074-59.532 89.072-.016 128.53-.034 281.266-.046 378.02-.006 53.237-43.158 96.393-96.394 96.406-69.26.016-162.244.039-231.485.055Z"/></svg>';
+
 function indexHtml(): string {
-  return listenPage("session", true);
+  return homeHtml();
+}
+
+function homeHtml(): string {
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="relay-home" content="1">
+<meta name="theme-color" content="#191919">
+<meta name="description" content="RELAY is a DAW insert. Share a named session. Listen on another machine or a phone. Open source, MPL-2.0.">
+<meta property="og:title" content="RELAY">
+<meta property="og:description" content="DAW insert. Share a named session. Listen on another machine or a phone.">
+<meta property="og:image" content="https://relay.matari-audio.com/plugin-share.png">
+<title>RELAY</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow:wght@500;600;700;900&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#191919;--lane:#252525;--surface:#353535;--sunken:#101010;--text:#fff;--muted:#b8b8b8;--accent:#00aaff;--ink:#041018;--hair:#2e2e2e}
+*{box-sizing:border-box}html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text);font-family:Barlow,system-ui,sans-serif;color-scheme:dark}
+::selection{background:var(--accent);color:var(--ink)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+body{display:flex;justify-content:center;padding:36px 16px calc(56px + env(safe-area-inset-bottom,0px))}
+.plate{width:min(920px,100%);padding:22px 22px 20px;background:var(--lane);border-radius:4px;box-shadow:inset 0 1px 0 #3f3f3f,0 18px 40px #00000073}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.nav{display:flex;align-items:center;gap:10px;height:32px;margin:0 0 22px}
+.mark{width:28px;height:17px;display:block;flex:none}
+.product{font-size:13px;font-weight:700;letter-spacing:.16em}
+.oss-nav{margin-left:auto;font-size:12px;font-weight:500;color:var(--muted);text-decoration:none}
+.oss-nav:hover{color:var(--text)}
+a{text-underline-offset:3px}
+.hero,.floor{display:grid;grid-template-columns:minmax(0,440px) minmax(16rem,1fr);gap:28px 36px;align-items:center}
+.floor{margin-top:28px;padding-top:22px;border-top:1px solid var(--hair)}
+.shot{margin:0;padding:10px 10px 12px;background:var(--sunken);border-radius:4px;box-shadow:inset 0 1px 4px #000000b3}
+.shot img{display:block;width:100%;height:auto;border-radius:2px}
+.shot figcaption{margin:10px 4px 0;font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+h1{margin:0;font-size:28px;font-weight:900;letter-spacing:-.03em;line-height:1.1}
+.lede{margin:12px 0 0;font-size:16px;font-weight:500;line-height:1.4;max-width:32ch}
+.note{margin:10px 0 0;font-size:13px;color:var(--muted);line-height:1.4;max-width:38ch}
+.actions{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:22px}
+.btn{display:inline-flex;align-items:center;justify-content:center;min-height:48px;padding:0 22px;font:inherit;font-weight:700;border:0;border-radius:4px;background:var(--accent);color:var(--ink);text-decoration:none;cursor:pointer}
+.btn:hover{filter:brightness(1.07)}
+.btn:active{transform:translateY(1px)}
+.formats{margin:10px 0 0;font-size:13px;color:var(--muted);line-height:1.4}
+.oss{margin:16px 0 0;font-size:13px;color:var(--muted);line-height:1.45;max-width:42ch}
+.oss a{color:var(--text)}
+.join{display:flex;flex-wrap:wrap;gap:10px 12px;align-items:end}
+.title{flex:1 1 180px;min-width:0;margin:0;padding:2px 0 8px;font:inherit;font-size:22px;font-weight:600;letter-spacing:-.02em;line-height:1.15;color:var(--text);background:transparent;border:0;border-bottom:1px solid var(--surface);caret-color:var(--accent);outline:none;border-radius:0}
+.title:hover,.title:focus{border-bottom-color:var(--accent)}
+.title::placeholder{color:#9a9a9a}
+.open{flex:none}
+.who{flex:1 0 100%;margin:2px 0 0;color:var(--muted);font-size:13px}
+@media (max-width:760px){.plate{padding:16px 14px 16px}.hero,.floor{grid-template-columns:1fr;gap:20px}h1{font-size:24px}.title{font-size:20px}}
+@media (prefers-reduced-motion:reduce){.btn:active{transform:none}}
+</style>
+</head>
+<body>
+<!--
+THESIS: Polar Night product plate. The plugin is the object; download is the action. Not a SaaS hero and not a listen box pretending to market.
+OWN-WORLD: BUFFR Studio Blue — #191919 wall, #252525 chassis, #101010 wells, #00aaff Download/Open, Barlow (900 display), 2–4px corners. Plugin rasters sit in sunken wells.
+STORY: This is a DAW insert you can get. Linux zip. Source on GitHub, MPL-2.0. Type a session name to listen.
+FIRST VIEWPORT: Nav mark + RELAY; Share raster left; “Share a named session.” + Download Linux + MPL/GitHub right. Join raster and session Open below.
+FORM: Polar Night chassis extended across /. Listen stays on /{slug}. Precise request 2026-08-19.
+FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, DESIGN.md, and every shipping raster carrying its provenance
+-->
+<main class="plate">
+  <header class="nav">
+    ${MATARI_MARK}
+    <span class="product">RELAY</span>
+    <a class="oss-nav" href="${SOURCE_URL}">Open source</a>
+  </header>
+  <div class="hero">
+    <figure class="shot">
+      <img src="/plugin-share.png" width="880" height="800" alt="RELAY plugin on Share: session big-filthy-papaya, ready, Send at 0 dB.">
+      <figcaption>Share</figcaption>
+    </figure>
+    <div>
+      <h1>Share a named session.</h1>
+      <p class="lede">DAW insert. Listen on another machine or a phone.</p>
+      <p class="note">LAN is uncompressed 5&nbsp;ms PCM. The public page is plugin-to-browser WebRTC. No account.</p>
+      <div class="actions">
+        <a class="btn" href="${LINUX_ZIP}">Download Linux</a>
+      </div>
+      <p class="formats">Linux x86_64 — CLAP, VST3, VST2, LV2.<br>macOS and Windows: build from source.</p>
+      <p class="oss">Open source under <a href="${LICENSE_URL}">MPL-2.0</a>. Source on <a href="${SOURCE_URL}">GitHub</a>.</p>
+    </div>
+  </div>
+  <div class="floor">
+    <figure class="shot">
+      <img src="/plugin-join.png" width="880" height="800" alt="RELAY plugin on Join: peer big-filthy-papaya, Mix, Send and Hear knobs.">
+      <figcaption>Join</figcaption>
+    </figure>
+    <form class="join" id="join">
+      <label class="sr-only" for="title">Session name</label>
+      <input id="title" class="title" placeholder="session name" autocomplete="off" spellcheck="false" enterkeyhint="go">
+      <button class="btn open" type="submit">Open</button>
+      <p class="who">Name from the plugin. Opens the listen page.</p>
+    </form>
+  </div>
+</main>
+<script>
+const join = document.getElementById('join');
+const title = document.getElementById('title');
+join.onsubmit = (ev) => {
+  ev.preventDefault();
+  const slug = String(title.value || '').toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 48);
+  if (slug) location.assign('/' + slug);
+};
+</script>
+</body>
+</html>`;
 }
 
 function playerHtml(name: string): string {
@@ -546,6 +668,7 @@ body{display:flex;justify-content:center;padding:28px 16px calc(56px + env(safe-
 .wrap{width:min(400px,100%);padding:20px 18px 16px;background:var(--lane);border-radius:4px;box-shadow:inset 0 1px 0 #3f3f3f,0 18px 40px #00000073}
 .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 .nav{display:flex;align-items:center;gap:10px;height:32px;margin:0 0 18px}
+.home-link{display:flex;align-items:center;gap:10px;color:inherit;text-decoration:none}
 .mark{width:28px;height:17px;display:block;flex:none}
 .product{font-size:13px;font-weight:700;letter-spacing:.16em}
 .lamp{width:8px;height:8px;border-radius:50%;margin-left:auto;background:#5a5a5a;box-shadow:0 1px 2px #0008}
@@ -613,8 +736,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
 -->
 <main class="wrap">
   <header class="nav">
-    <svg class="mark" viewBox="0 0 2408 1488" aria-hidden="true"><path fill="#fff" d="M99.021 1486.974c-53.202.013-96.36-43.07-96.439-96.273C2.179 1122.129 1.048 366.891.645 97.561.606 71.902 10.797 47.286 28.962 29.162 47.126 11.039 71.765.904 97.424 1c69.143.26 159.026.597 212.615.799 29.175.109 56.732 13.423 74.949 36.212 86.302 107.957 344.363 430.771 467.706 585.064 17.097 21.388 42.482 34.497 69.819 36.057 27.337 1.559 54.048-8.578 73.466-27.882 155.807-154.885 504.705-501.721 606.179-602.595 18.054-17.947 42.472-28.026 67.928-28.038 44.951-.022 118.986-.057 173.583-.084 41.56-.02 78.456 26.593 91.552 66.036 75.96 228.788 328.628 989.806 429.472 1293.541 9.759 29.393 4.804 61.685-13.319 86.8-18.123 25.115-47.207 39.995-78.178 39.998-256.183.023-811.251.072-1038.748.093-16.809.001-31.963-10.123-38.396-25.652-6.433-15.529-2.878-33.404 9.007-45.29 59.457-59.456 141.243-141.242 183.755-183.754 18.081-18.081 42.604-28.24 68.174-28.24 56.829-.002 163.744-.005 250.405-.008 30.989-.001 60.088-14.896 78.21-40.034 18.121-25.138 23.056-57.454 13.262-86.855-34.745-104.305-84.02-252.224-120.519-361.795-10.545-31.654-36.704-55.606-69.162-63.328-32.459-7.721-66.602 1.887-90.27 25.402-148.441 147.483-408.034 405.401-530.914 527.487-37.693 37.45-98.58 37.346-136.145-.232-66.869-66.892-171.554-171.613-260.274-260.363-27.571-27.58-69.041-35.836-105.073-20.918-36.031 14.919-59.528 50.074-59.532 89.072-.016 128.53-.034 281.266-.046 378.02-.006 53.237-43.158 96.393-96.394 96.406-69.26.016-162.244.039-231.485.055Z"/></svg>
-    <span class="product">RELAY</span>
+    <a class="home-link" href="/" aria-label="RELAY home">${MATARI_MARK}<span class="product">RELAY</span></a>
     <span class="lamp" id="lamp" data-state="wait" aria-hidden="true"></span>
   </header>
   ${landing ? `<form class="join" id="join">
