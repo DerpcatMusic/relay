@@ -1,13 +1,16 @@
 //! RELAY editor: Polar Night chrome, Share/Join, full-height L/R meters.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use egui_phosphor::regular as ph;
 use relay_session::{
     DEFAULT_CONNECT_PORT, PUBLIC_LINK_ORIGIN, SessionPill, SessionView, classify_session,
     format_session_status, normalize_slug,
 };
 use truce_core::editor::{PluginContext, PluginContextReadF32};
 use truce_egui::EditorUi;
+use truce_font::JETBRAINS_MONO;
 
 use crate::{
     Codec, MAX_WINDOW_H, MAX_WINDOW_W, METER_FLOOR_DB, MIN_WINDOW_H, MIN_WINDOW_W, Monitor,
@@ -17,13 +20,12 @@ use crate::{
 const MATARI_URL: &str = "https://matari-audio.com";
 const RELAY_URL: &str = "https://matari-audio.com";
 const GAIN_DEFAULT_01: f32 = 24.0 / 36.0;
-const METER_COL: f32 = 28.0;
+const METER_COL: f32 = 42.0;
+const METER_RAIL: f32 = 16.0;
+const HEADER_H: f32 = 44.0;
 
-const ICON_DICE: &[u8] = include_bytes!("../assets/icons/dice-five.svg");
-const ICON_COPY: &[u8] = include_bytes!("../assets/icons/copy.svg");
-const ICON_OPEN: &[u8] = include_bytes!("../assets/icons/arrow-square-out.svg");
-const ICON_LOCK: &[u8] = include_bytes!("../assets/icons/lock-simple.svg");
-const ICON_CHECK: &[u8] = include_bytes!("../assets/icons/check.svg");
+const BARLOW: &[u8] = include_bytes!("../assets/fonts/Barlow-SemiBold.ttf");
+const BARLOW_BLACK: &[u8] = include_bytes!("../assets/fonts/Barlow-Black.ttf");
 
 /// BUFFR Studio Blue — same tokens as drop-recorder `themes.json`.
 const BG: egui::Color32 = egui::Color32::from_rgb(25, 25, 25);
@@ -60,6 +62,7 @@ pub struct RelayUi {
     hold_age_r: f32,
     last_h: u32,
     overlay: Overlay,
+    chrome: bool,
 }
 
 impl RelayUi {
@@ -75,6 +78,7 @@ impl RelayUi {
             hold_age_r: 0.0,
             last_h: window_h,
             overlay: Overlay::None,
+            chrome: false,
         }
     }
 }
@@ -106,6 +110,10 @@ impl EditorUi<RelayParams> for RelayUi {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, ctx: &PluginContext<RelayParams>) {
+        if !self.chrome {
+            install_chrome(ui.ctx());
+            self.chrome = true;
+        }
         apply_buffr_spacing(ui);
         let snap = ctx.params().control.snapshot();
         let linked = ctx.params().link.value();
@@ -113,25 +121,53 @@ impl EditorUi<RelayParams> for RelayUi {
         let web_ok = ctx.params().control.web_ok();
         let web_silent = ctx.params().control.web_silent();
         egui::Panel::top("header")
-            .exact_size(40.0)
+            .exact_size(HEADER_H)
             .frame(egui::Frame::NONE.fill(BG))
             .show(ui, |ui| {
-                ui.horizontal_centered(|ui| {
-                    ui.add_space(10.0);
-                    if relay_logo(ui).clicked() {
-                        self.overlay = if self.overlay == Overlay::About {
-                            Overlay::None
-                        } else {
-                            Overlay::About
-                        };
-                    }
-                    ui.add_space(10.0);
-                    mode_nav(ui, ctx, product);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_space(10.0);
+                let rect = ui.max_rect();
+                let mid_w = 156.0;
+                let side_w = ((rect.width() - mid_w) * 0.5).max(96.0);
+                let left =
+                    egui::Rect::from_min_size(rect.left_top(), egui::vec2(side_w, rect.height()));
+                let mid =
+                    egui::Rect::from_center_size(rect.center(), egui::vec2(mid_w, rect.height()));
+                let right = egui::Rect::from_min_max(
+                    egui::pos2(rect.right() - side_w, rect.top()),
+                    rect.right_bottom(),
+                );
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(left)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    |ui| {
+                        ui.add_space(12.0);
+                        if relay_logo(ui).clicked() {
+                            self.overlay = if self.overlay == Overlay::About {
+                                Overlay::None
+                            } else {
+                                Overlay::About
+                            };
+                        }
+                    },
+                );
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(mid)
+                        .layout(egui::Layout::top_down(egui::Align::Center)),
+                    |ui| {
+                        ui.add_space(((HEADER_H - 26.0) * 0.5).max(0.0));
+                        mode_nav(ui, ctx, product);
+                    },
+                );
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(right)
+                        .layout(egui::Layout::right_to_left(egui::Align::Center)),
+                    |ui| {
+                        ui.add_space(12.0);
                         live_pill(ui, ctx, linked, snap, web_ok, web_silent);
-                    });
-                });
+                    },
+                );
             });
 
         let peak_l = ctx.get_meter(P::MeterLeft);
@@ -146,7 +182,7 @@ impl EditorUi<RelayParams> for RelayUi {
             .frame(
                 egui::Frame::NONE
                     .fill(BG)
-                    .inner_margin(egui::Margin::symmetric(7, 10)),
+                    .inner_margin(egui::Margin::symmetric(12, 8)),
             )
             .show(ui, |ui| {
                 meter_column(ui, peak_l, self.hold_l, "L");
@@ -159,7 +195,7 @@ impl EditorUi<RelayParams> for RelayUi {
             .frame(
                 egui::Frame::NONE
                     .fill(BG)
-                    .inner_margin(egui::Margin::symmetric(7, 10)),
+                    .inner_margin(egui::Margin::symmetric(12, 8)),
             )
             .show(ui, |ui| {
                 meter_column(ui, peak_r, self.hold_r, "R");
@@ -302,6 +338,39 @@ pub fn buffr_visuals() -> egui::Visuals {
     visuals
 }
 
+fn install_chrome(ctx: &egui::Context) {
+    egui_extras::install_image_loaders(ctx);
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "barlow".to_owned(),
+        Arc::new(egui::FontData::from_static(BARLOW)),
+    );
+    fonts.font_data.insert(
+        "barlow-black".to_owned(),
+        Arc::new(egui::FontData::from_static(BARLOW_BLACK)),
+    );
+    fonts.font_data.insert(
+        "jetbrains".to_owned(),
+        Arc::new(egui::FontData::from_static(JETBRAINS_MONO)),
+    );
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, "barlow".to_owned());
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .insert(0, "jetbrains".to_owned());
+    fonts.families.insert(
+        egui::FontFamily::Name("relay-black".into()),
+        vec!["barlow-black".to_owned()],
+    );
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+    ctx.set_fonts(fonts);
+}
+
 fn apply_buffr_spacing(ui: &mut egui::Ui) {
     let spacing = &mut ui.style_mut().spacing;
     spacing.item_spacing = egui::vec2(8.0, 6.0);
@@ -316,10 +385,10 @@ fn relay_logo(ui: &mut egui::Ui) -> egui::Response {
         paint_matari_mark(ui, egui::vec2(26.0, 16.0));
         ui.label(
             egui::RichText::new("RELAY")
-                .size(13.0)
+                .family(egui::FontFamily::Name("relay-black".into()))
+                .size(18.0)
                 .color(TEXT)
-                .strong()
-                .extra_letter_spacing(1.6),
+                .extra_letter_spacing(1.4),
         );
     })
     .response
@@ -649,7 +718,7 @@ fn session_row(ui: &mut egui::Ui, state: &mut RelayUi, ctx: &PluginContext<Relay
         {
             commit_name(state, ctx);
         }
-        if icon_btn(ui, "bytes://phosphor/dice-five.svg", ICON_DICE, "New name").clicked() {
+        if icon_btn(ui, ph::DICE_FIVE, "New name").clicked() {
             state.name_buf = new_slug();
             commit_name(state, ctx);
         }
@@ -657,30 +726,19 @@ fn session_row(ui: &mut egui::Ui, state: &mut RelayUi, ctx: &PluginContext<Relay
             .copied
             .as_ref()
             .is_some_and(|(_, at)| at.elapsed() < Duration::from_secs(2));
-        let (copy_uri, copy_bytes, copy_tip) = if copied {
-            (
-                "bytes://phosphor/check.svg",
-                ICON_CHECK,
-                "Copied listen link",
-            )
+        let (copy_glyph, copy_tip) = if copied {
+            (ph::CHECK, "Copied listen link")
         } else {
-            ("bytes://phosphor/copy.svg", ICON_COPY, "Copy listen link")
+            (ph::COPY, "Copy listen link")
         };
-        if icon_btn(ui, copy_uri, copy_bytes, copy_tip).clicked() {
+        if icon_btn(ui, copy_glyph, copy_tip).clicked() {
             commit_name(state, ctx);
             let url = public_url(&state.name_buf);
             copy_link(&url);
             ui.ctx().copy_text(url.clone());
             state.copied = Some((url, Instant::now()));
         }
-        if icon_btn(
-            ui,
-            "bytes://phosphor/arrow-square-out.svg",
-            ICON_OPEN,
-            "Open listen page",
-        )
-        .clicked()
-        {
+        if icon_btn(ui, ph::ARROW_SQUARE_OUT, "Open listen page").clicked() {
             commit_name(state, ctx);
             let url = public_url(&state.name_buf);
             let _ = open::that_detached(&url);
@@ -691,12 +749,7 @@ fn session_row(ui: &mut egui::Ui, state: &mut RelayUi, ctx: &PluginContext<Relay
 fn password_row(ui: &mut egui::Ui, state: &mut RelayUi, ctx: &PluginContext<RelayParams>) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
-        ui.add(
-            egui::Image::from_bytes("bytes://phosphor/lock-simple.svg", ICON_LOCK)
-                .fit_to_exact_size(egui::vec2(16.0, 16.0))
-                .tint(MUTED)
-                .alt_text("Password"),
-        );
+        ui.label(egui::RichText::new(ph::LOCK_SIMPLE).size(16.0).color(MUTED));
         let response = ui.add(
             egui::TextEdit::singleline(&mut state.pass_buf)
                 .password(true)
@@ -791,17 +844,9 @@ fn codec_summary(ctx: &PluginContext<RelayParams>, codec: Codec) -> String {
     }
 }
 
-fn icon_btn(
-    ui: &mut egui::Ui,
-    uri: &'static str,
-    bytes: &'static [u8],
-    tip: &str,
-) -> egui::Response {
-    let image = egui::Image::from_bytes(uri, bytes)
-        .fit_to_exact_size(egui::vec2(16.0, 16.0))
-        .tint(TEXT);
+fn icon_btn(ui: &mut egui::Ui, glyph: &str, tip: &str) -> egui::Response {
     ui.add(
-        egui::Button::image(image)
+        egui::Button::new(egui::RichText::new(glyph).size(16.0).color(TEXT))
             .fill(LANE)
             .corner_radius(4.0)
             .min_size(egui::vec2(28.0, 28.0)),
@@ -892,18 +937,13 @@ fn meter_column(ui: &mut egui::Ui, peak: f32, hold: f32, label: &str) {
                 egui::Color32::from_rgb(42, 32, 32)
             },
         );
-        ui.add_space(4.0);
+        ui.add_space(6.0);
         let rail_h = (ui.available_height() - 18.0).max(48.0);
-        let (rail, _) = ui.allocate_exact_size(egui::vec2(10.0, rail_h), egui::Sense::hover());
+        let (rail, _) =
+            ui.allocate_exact_size(egui::vec2(METER_RAIL, rail_h), egui::Sense::hover());
         paint_gyr_rail(ui.painter(), rail, db, peak_to_db(hold));
         ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new(label)
-                .size(11.0)
-                .color(MUTED)
-                .strong()
-                .extra_letter_spacing(0.8),
-        );
+        ui.label(egui::RichText::new(label).size(11.0).color(MUTED).strong());
     });
 }
 

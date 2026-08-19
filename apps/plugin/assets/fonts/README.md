@@ -1,0 +1,2 @@
+Barlow Black + SemiBold, SIL Open Font License 1.1.
+https://github.com/jpt/barlow

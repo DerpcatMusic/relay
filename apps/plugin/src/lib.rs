@@ -15,15 +15,14 @@ use relay_session::{
 };
 use truce::prelude::*;
 use truce_egui::EguiEditor;
-use truce_font::JETBRAINS_MONO;
 
 use editor::{RelayUi, buffr_visuals};
 
 use RelayParamsParamId as P;
 
-pub(crate) const WINDOW_W: u32 = 428;
+pub(crate) const WINDOW_W: u32 = 440;
 pub(crate) const WINDOW_H: u32 = 400;
-pub(crate) const MIN_WINDOW_W: u32 = 380;
+pub(crate) const MIN_WINDOW_W: u32 = 400;
 pub(crate) const MIN_WINDOW_H: u32 = 380;
 pub(crate) const MAX_WINDOW_W: u32 = 560;
 pub(crate) const MAX_WINDOW_H: u32 = 720;
@@ -399,8 +398,7 @@ impl PluginLogic for RelayPlugin {
                 .resizable(true)
                 .min_size((MIN_WINDOW_W, MIN_WINDOW_H))
                 .max_size((MAX_WINDOW_W, MAX_WINDOW_H))
-                .with_visuals(buffr_visuals())
-                .with_font(JETBRAINS_MONO),
+                .with_visuals(buffr_visuals()),
         )
     }
 }

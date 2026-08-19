@@ -53,6 +53,8 @@ truce-font = { path = "../../../truce-derpcat/crates/truce-font" }
 truce-loader = { path = "../../../truce-derpcat/crates/truce-loader" }
 truce-egui = { path = "../../../truce-derpcat/crates/truce-egui" }
 egui = "0.35"
+egui_extras = { version = "0.35", default-features = false, features = ["svg"] }
+egui-phosphor = { version = "0.13", default-features = false, features = ["regular"] }
 ureq = "2.12"
 tungstenite = { version = "0.26", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
