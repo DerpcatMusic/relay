@@ -16,7 +16,7 @@ RELAY is a low-latency insert: send the track that is playing, hear it on anothe
 
 ## Positioning
 
-Unofficial assumption, from the existing repo and this request: RELAY is the Matari Audio communications plugin in the same product line as BUFFR. LAN is uncompressed 5 ms PCM. `/{slug}` is a named listen fan-out. `/` is the product plate: Linux plugin download, current editor shots, MPL-2.0 / GitHub. SonoBus-like P2P on the LAN; not a billed LISTENTO clone.
+Unofficial assumption, from the existing repo and this request: RELAY is the Matari Audio communications plugin in the same product line as BUFFR. LAN is uncompressed 5 ms PCM. The website is a named listen fan-out, not the musician path. SonoBus-like P2P on the LAN; not a billed LISTENTO clone. Product download is https://matari-audio.com/relay.
 
 ## Operating Context
 
@@ -43,7 +43,7 @@ Loaded as a CLAP, VST3, VST2, LV2, or AU (v2/v3 on macOS) insert in Bitwig and o
 - ADRs 0001–0006 (Rust core, 48 kHz clock, Opus, transport bake-off still open)
 - Installed binaries: `~/.clap/RELAY.clap`, `~/.vst3/RELAY.vst3`
 - Live listen: https://relay.matari-audio.com
-- Linux plugin zip: GitHub Releases (`RELAY-linux.zip`)
+- Product page: https://matari-audio.com/relay
 
 ## Product Principles
 

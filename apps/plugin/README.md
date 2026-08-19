@@ -24,9 +24,7 @@ cargo truce install
 
 Public listen: https://relay.matari-audio.com/`<session-name>`
 
-Linux binaries (CLAP / VST3 / VST2 / LV2): [Download Linux](https://github.com/DerpcatMusic/relay/releases/latest/download/RELAY-linux.zip) from [the site](https://relay.matari-audio.com). macOS and Windows: `cargo truce install` from this repo.
-
-Licensed [MPL-2.0](../../LICENSE). Rescan plugins in the DAW.
+Downloads: [matari-audio.com/relay](https://matari-audio.com/relay). Licensed [MPL-2.0](../../LICENSE). Rescan plugins in the DAW.
 
 ## Home LAN (use this)
 

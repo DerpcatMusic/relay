@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -30,29 +30,11 @@ test("page advertises listen revision 12", () => {
   assert.match(src, /name="relay-listen" content="12"/);
 });
 
-test("home offers a Linux download, current plugin shots, and MPL source", () => {
-  const home = src.slice(src.indexOf("function homeHtml"), src.indexOf("function playerHtml"));
-  assert.match(src, /name="relay-home" content="1"/);
-  assert.match(src, /github.com\/DerpcatMusic\/relay/);
-  assert.match(src, /RELAY-linux\.zip/);
-  assert.match(home, /Download Linux/);
-  assert.match(home, /plugin-share\.png/);
-  assert.match(home, /plugin-join\.png/);
-  assert.match(home, /MPL-2\.0/);
-  assert.match(home, /\$\{SOURCE_URL\}/);
-  assert.match(home, /\$\{LINUX_ZIP\}/);
-  assert.match(home, /Open source/);
-  assert.match(home, /build from source/);
-  assert.doesNotMatch(home, /id="go"/);
-  const dir = dirname(fileURLToPath(import.meta.url));
-  assert.equal(existsSync(join(dir, "../public/plugin-share.png")), true);
-  assert.equal(existsSync(join(dir, "../public/plugin-join.png")), true);
-});
-
-test("listen chassis still lives on named sessions", () => {
-  assert.match(src, /function listenPage/);
-  assert.match(src, /name="relay-listen" content="12"/);
-  assert.match(src, /button id="go"/);
+test("root is the listen join box, not a product landing", () => {
+  assert.match(src, /function indexHtml/);
+  assert.match(src, /listenPage\("session", true\)/);
+  assert.equal(src.includes("function homeHtml"), false);
+  assert.equal(src.includes("Download Linux"), false);
 });
 
 test("host joining a waiting listener is asked for an offer", () => {

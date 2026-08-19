@@ -95,7 +95,7 @@ components:
 
 RELAY listen is a small hardware unit on a studio wall, not a marketing page and not a WebRTC demo card. The visitor meets a BUFFR Studio Blue plate: Polar Night around it, a #252525 chassis, sunken #101010 wells, flat GYR rails, a flat fader cap, and one Studio Blue action (Listen / Open). Barlow carries every label. Corners stay 2–4px.
 
-The same tokens ship in the DAW editor. `/` is a Polar Night product plate: current plugin rasters, a Linux download, and an MPL-2.0 / GitHub line, plus a session-name Open. `/{slug}` is the listen accessory: type the session name, tap Listen, watch L and R, pull the fader. Diagnostics live in a tape you open.
+The same tokens ship in the DAW editor. The website is a listen accessory for that insert: type the session name, tap Listen, watch L and R, pull the fader. Diagnostics live in a tape you open. Product download lives at matari-audio.com/relay.
 
 **Key Characteristics:**
 - Polar Night ground, chassis plate, sunken wells — three neutrals, no glass
@@ -215,4 +215,4 @@ Hardware, not pills. Chassis and primary button 4px; mute and tape well 3px; met
 - **Don't** make the log the main content or an `aria-live` dump of ICE.
 - **Don't** use 12–16px card radii, glass, or a SaaS dashboard layout.
 - **Don't** invent a second typeface. Barlow is the product face.
-- **Don't** fill `/{slug}` with marketing sections; that surface is a listen box. `/` may carry the plugin, the download, and the license — still on the same chassis, not a SaaS landing.
+- **Don't** fill Polar Night with marketing sections; this surface is a listen box.
