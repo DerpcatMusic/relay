@@ -2,6 +2,11 @@
   "name": "relay",
   "private": true,
   "license": "MPL-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DerpcatMusic/relay.git"
+  },
+  "homepage": "https://relay.matari-audio.com",
   "packageManager": "pnpm@11.22.0",
   "scripts": {
     "build": "pnpm --recursive build",

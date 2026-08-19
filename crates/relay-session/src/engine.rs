@@ -19,6 +19,22 @@ use crate::wire::WirePacket;
 
 const PAYLOAD_TYPE: u8 = 111;
 const CHANNELS: usize = 2;
+const MEDIA_RATE_HZ: u64 = 48_000;
+
+/// Maps 48 kHz media frames onto a device clock without truncating remainders.
+#[must_use]
+pub fn advance_scheduled(
+    local: u64,
+    acc: u64,
+    media_frames: u64,
+    device_rate_hz: u64,
+) -> (u64, u64) {
+    let acc = acc.saturating_add(media_frames.saturating_mul(device_rate_hz));
+    (
+        local.saturating_add(acc / MEDIA_RATE_HZ),
+        acc % MEDIA_RATE_HZ,
+    )
+}
 
 /// How the host callback mixes local and remote audio.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -107,6 +123,10 @@ pub struct SessionSnapshot {
     pub peers: usize,
     /// Bound UDP port, if any.
     pub local_port: Option<u16>,
+    /// True when a UDP socket is bound (hosting or joining).
+    pub bound: bool,
+    /// Concealed or missing frames since the worker started.
+    pub dropouts: u32,
 }
 
 /// One worker-side drive result.
@@ -150,6 +170,8 @@ pub struct CallbackFace {
     staging: Vec<f32>,
     staging_filled: usize,
     monitor: MonitorMode,
+    /// Converter output plus algorithmic delay, in device frames.
+    latency_frames: u32,
 }
 
 /// Worker-thread owner of sockets, codec, and playback publication.
@@ -166,6 +188,8 @@ pub struct SessionWorker {
     batch: PacketBatch,
     capture_chunk: Box<[f32]>,
     scheduled_local: u64,
+    scheduled_acc: u64,
+    playback_faulted: bool,
     remote_ssrc: Option<u32>,
     slug: [u8; 48],
     slug_len: u8,
@@ -182,6 +206,8 @@ pub struct SessionWorker {
     web_pcm_seq: u64,
     lan_frame: PcmFrame,
     last_who: Instant,
+    last_lan_seq: Option<u16>,
+    dropouts: u32,
 }
 
 /// Connect / Stream engine. Callback methods never touch the socket.
@@ -224,9 +250,10 @@ impl SessionEngine {
             },
         )
         .map_err(|_| EngineBuildError::Rx)?;
+        let playback_config = PlaybackConfig::for_pipeline(pipeline);
+        let latency_frames = u32::try_from(playback_config.target_fill_frames).unwrap_or(u32::MAX);
         let (playback, renderer, _metrics) =
-            playback_pair(pipeline, PlaybackConfig::for_pipeline(pipeline))
-                .map_err(|_| EngineBuildError::Playback)?;
+            playback_pair(pipeline, playback_config).map_err(|_| EngineBuildError::Playback)?;
         let chunk_samples = tx.capture_chunk_samples();
         let media_pcm_samples = tx.media_pcm_frame_samples();
         let (capture_tx, capture_rx, _capture_metrics) =
@@ -244,6 +271,7 @@ impl SessionEngine {
                 staging: vec![0.0; chunk_samples],
                 staging_filled: 0,
                 monitor: config.monitor,
+                latency_frames,
             },
             worker: SessionWorker {
                 config,
@@ -258,6 +286,8 @@ impl SessionEngine {
                 batch,
                 capture_chunk: capture_chunk.into_boxed_slice(),
                 scheduled_local: 0,
+                scheduled_acc: 0,
+                playback_faulted: false,
                 remote_ssrc: None,
                 slug: [0; 48],
                 slug_len: 0,
@@ -280,6 +310,8 @@ impl SessionEngine {
                 last_who: Instant::now()
                     .checked_sub(Duration::from_secs(1))
                     .unwrap_or_else(Instant::now),
+                last_lan_seq: None,
+                dropouts: 0,
             },
         })
     }
@@ -370,6 +402,12 @@ impl CallbackFace {
         self.monitor = monitor;
     }
 
+    /// Device frames of playback delay the host can report as latency.
+    #[must_use]
+    pub fn playback_target_frames(&self) -> u32 {
+        self.latency_frames
+    }
+
     /// Host-callback render. Zero-fills, then applies the monitor policy.
     #[must_use]
     pub fn render(&mut self, output: &mut [f32], dry: &[f32]) -> RenderReport {
@@ -398,6 +436,8 @@ impl SessionWorker {
             route: self.route,
             peers: self.plane.peer_count(),
             local_port: self.plane.local_addr().map(|addr| addr.port()),
+            bound: self.plane.role() != SocketRole::Idle,
+            dropouts: self.dropouts.saturating_add(rx_dropouts(&self.rx)),
         }
     }
 
@@ -620,6 +660,9 @@ impl SessionWorker {
                     self.rx.ingress(packet).status(),
                     IngressStatus::AcceptedInOrder | IngressStatus::AcceptedReordered { .. }
                 );
+                if !accepted {
+                    self.dropouts = self.dropouts.saturating_add(1);
+                }
                 self.state = ConnectionState::Connected;
                 return Ok(accepted);
             }
@@ -662,6 +705,7 @@ impl SessionWorker {
                     bytes.extend_from_slice(&sample.to_le_bytes());
                 }
                 self.plane.remember(from);
+                self.note_lan_seq(sequence);
                 self.adopt_remote(ssrc, Some(sequence), Some(timestamp));
                 self.push_lan_pcm(&bytes, timestamp);
                 self.state = ConnectionState::Connected;
@@ -685,6 +729,7 @@ impl SessionWorker {
                     return Ok(false);
                 }
                 self.plane.remember(from);
+                self.note_lan_seq(sequence);
                 self.adopt_remote(ssrc, Some(sequence), Some(timestamp));
                 self.push_lan_pcm(&samples, timestamp);
                 self.state = ConnectionState::Connected;
@@ -693,6 +738,24 @@ impl SessionWorker {
             WirePacket::_Reserved(_) => {}
         }
         Ok(false)
+    }
+
+    /// Destinations currently receiving or sending media.
+    #[must_use]
+    pub fn peer_addrs(&self) -> Vec<SocketAddr> {
+        self.plane.peer_addrs()
+    }
+
+    fn note_lan_seq(&mut self, sequence: u16) {
+        if let Some(prev) = self.last_lan_seq {
+            let gap = sequence.wrapping_sub(prev);
+            if gap > 1 {
+                self.dropouts = self
+                    .dropouts
+                    .saturating_add(u32::from(gap.saturating_sub(1)));
+            }
+        }
+        self.last_lan_seq = Some(sequence);
     }
 
     fn allows(&self, token: &[u8; 32]) -> bool {
@@ -755,28 +818,41 @@ impl SessionWorker {
         if self.pcm_decode.len() < frame_samples {
             self.pcm_decode.resize(frame_samples, 0.0);
         }
+        let at_media_rate = self.pipeline.playback_rate_hz() == MEDIA_RATE_HZ as usize;
         let mut ts = timestamp;
         for packet_chunk in samples.chunks_exact(frame_samples.saturating_mul(2)) {
             for (index, pair) in packet_chunk.chunks_exact(2).enumerate() {
                 let quant = i16::from_le_bytes([pair[0], pair[1]]);
                 self.pcm_decode[index] = f32::from(quant) / 32_767.0;
             }
-            if !self
-                .lan_frame
-                .copy_from_interleaved(&self.pcm_decode[..frame_samples])
-            {
-                break;
-            }
-            let remote = ExtendedTimestamp::starting_at(RtpTimestamp::new(ts));
-            let local = self.scheduled_local;
-            match self.playback.process_frame(&self.lan_frame, remote, local) {
-                Ok(_) | Err(PlaybackProcessError::EndOfStream) => {}
-                Err(_) => break,
+            if at_media_rate {
+                match self.playback.push_direct(&self.pcm_decode[..frame_samples]) {
+                    WriteOutcome::Written { .. } => {}
+                    _ => break,
+                }
+            } else {
+                if !self.try_recover_playback() {
+                    break;
+                }
+                if !self
+                    .lan_frame
+                    .copy_from_interleaved(&self.pcm_decode[..frame_samples])
+                {
+                    break;
+                }
+                let remote = ExtendedTimestamp::starting_at(RtpTimestamp::new(ts));
+                let local = self.scheduled_local;
+                match self.playback.process_frame(&self.lan_frame, remote, local) {
+                    Ok(_) | Err(PlaybackProcessError::EndOfStream) => {}
+                    Err(_) => {
+                        self.playback_faulted = true;
+                        let _ = self.try_recover_playback();
+                        break;
+                    }
+                }
             }
             let frame_frames = (frame_samples / CHANNELS) as u64;
-            self.scheduled_local = self.scheduled_local.saturating_add(
-                frame_frames.saturating_mul(self.pipeline.playback_rate_hz() as u64) / 48_000,
-            );
+            self.advance_clock(frame_frames);
             ts = ts.wrapping_add(frame_frames as u32);
         }
     }
@@ -802,6 +878,9 @@ impl SessionWorker {
     }
 
     fn pump_rx(&mut self, media_received: u32) -> u64 {
+        if !self.try_recover_playback() {
+            return 0;
+        }
         let mut decoded = 0;
         for _ in 0..media_received {
             let Some(outcome) = self.rx.tick() else {
@@ -812,14 +891,40 @@ impl SessionWorker {
             let frame_frames = outcome.frame().samples_per_channel() as u64;
             match self.playback.process_frame(outcome.frame(), remote, local) {
                 Ok(_) | Err(PlaybackProcessError::EndOfStream) => {}
-                Err(_) => break,
+                Err(_) => {
+                    self.playback_faulted = true;
+                    let _ = self.try_recover_playback();
+                    break;
+                }
             }
-            self.scheduled_local = self.scheduled_local.saturating_add(
-                frame_frames.saturating_mul(self.pipeline.playback_rate_hz() as u64) / 48_000,
-            );
+            self.advance_clock(frame_frames);
             decoded += 1;
         }
         decoded
+    }
+
+    fn advance_clock(&mut self, media_frames: u64) {
+        let (local, acc) = advance_scheduled(
+            self.scheduled_local,
+            self.scheduled_acc,
+            media_frames,
+            self.pipeline.playback_rate_hz() as u64,
+        );
+        self.scheduled_local = local;
+        self.scheduled_acc = acc;
+    }
+
+    fn try_recover_playback(&mut self) -> bool {
+        if !self.playback_faulted {
+            return true;
+        }
+        if self.playback.reset_when_empty().is_ok() {
+            self.scheduled_local = 0;
+            self.scheduled_acc = 0;
+            self.playback_faulted = false;
+            return true;
+        }
+        false
     }
 
     fn pump_tx(&mut self) -> Result<u64, PlaneError> {
@@ -969,6 +1074,17 @@ impl SessionWorker {
     }
 }
 
+fn rx_dropouts(rx: &RxWorker) -> u32 {
+    let metrics = rx.metrics();
+    u32::try_from(
+        metrics
+            .plc_frames
+            .saturating_add(metrics.late)
+            .min(u64::from(u32::MAX)),
+    )
+    .unwrap_or(u32::MAX)
+}
+
 fn pipeline_for(
     rate_hz: usize,
     duration: FrameDuration,
@@ -1005,7 +1121,36 @@ fn copy_dry(output: &mut [f32], dry: &[f32]) {
 fn mix_dry(output: &mut [f32], dry: &[f32]) {
     let n = output.len().min(dry.len());
     for index in 0..n {
-        let mixed = output[index] + dry[index];
-        output[index] = mixed.clamp(-1.0, 1.0);
+        output[index] += dry[index];
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MEDIA_RATE_HZ, advance_scheduled, mix_dry};
+
+    #[test]
+    fn scheduled_48k_stays_on_media_frames() {
+        let (local, acc) = advance_scheduled(0, 0, 240, MEDIA_RATE_HZ);
+        assert_eq!(local, 240);
+        assert_eq!(acc, 0);
+    }
+
+    #[test]
+    fn scheduled_44100_keeps_the_half_frame() {
+        let mut local = 0;
+        let mut acc = 0;
+        for _ in 0..2 {
+            (local, acc) = advance_scheduled(local, acc, 240, 44_100);
+        }
+        assert_eq!(local, 441);
+        assert_eq!(acc, 0);
+    }
+
+    #[test]
+    fn mix_dry_does_not_hard_clip() {
+        let mut out = [0.8_f32];
+        mix_dry(&mut out, &[0.8]);
+        assert!((out[0] - 1.6).abs() < 1e-6);
     }
 }

@@ -13,7 +13,10 @@ fourcc = "RlyP"
 au3_subtype = "RlP3"
 au_tag = "Effects"
 vst3_subcategory = "Tools"
+vst2_name = "RELAY"
+au_name = "RELAY"
 au3_name = "RELAY (AUv3)"
+lv2_name = "RELAY"
 description = """
 Matari Audio RELAY — low-latency DAW-to-DAW connect and unpaid listen. \
 No subscription or paid TURN path.

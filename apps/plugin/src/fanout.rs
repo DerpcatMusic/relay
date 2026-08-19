@@ -1,4 +1,4 @@
-//! Public named-session claim and PCM upload to `relay.matari-audio.com`.
+//! Public named-session claim and P2P signaling to `relay.matari-audio.com`.
 //! Same-LAN browsers are served from [`crate::local_listen`] instead.
 
 use std::collections::VecDeque;
@@ -21,7 +21,20 @@ type CloudSocket = WebSocket<MaybeTlsStream<std::net::TcpStream>>;
 pub fn spawn(control: Arc<SessionControl>, stop: Arc<AtomicBool>) -> thread::JoinHandle<()> {
     thread::Builder::new()
         .name("relay-link-fanout".into())
-        .spawn(move || run(control, stop))
+        .spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                let again = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run(Arc::clone(&control), Arc::clone(&stop));
+                }));
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                if again.is_err() {
+                    control.set_last_error("listen thread restarted");
+                }
+                thread::sleep(Duration::from_millis(80));
+            }
+        })
         .expect("link fanout thread")
 }
 
@@ -40,11 +53,19 @@ const KEEP_SAMPLES: usize = 48_000 / 5 * 2;
 const SILENCE_PEAK: f32 = 0.001;
 /// Two 20 ms frames — delay send so silence/unsilence is visible 40 ms early.
 const LOOKAHEAD_FRAMES: usize = 2;
-/// 30 ms raised-cosine fade across DTX edges (stereo 48 kHz).
-const FADE_SAMPLES: usize = 48_000 / 1000 * 30 * 2;
+/// 20 ms raised-cosine fade across DTX edges (stereo 48 kHz).
+const FADE_SAMPLES: usize = WEB_BATCH_SAMPLES;
+/// 20 × 20 ms of already-quiet audio before we stop sending. Short gaps must
+/// not fade a still-audible tail — that is the click on silence / unsilence.
+const HANGOVER_FRAMES: u32 = 20;
+/// Protocol pings keep the Cloudflare `/in` socket from being dropped idle.
+const PING_EVERY: Duration = Duration::from_secs(12);
+/// Host-callback starvation (DAW suspended / no PCM) after this many empty takes.
+const STARVE_EMPTY: u32 = 12;
 
 fn run(control: Arc<SessionControl>, stop: Arc<AtomicBool>) {
-    let hub = LocalHub::start(Arc::clone(&control));
+    let hub = LocalHub::start(Arc::clone(&control), Arc::clone(&stop));
+    let mut p2p = crate::p2p::Hub::new();
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(2))
         .user_agent("Mozilla/5.0 RELAY/0.1")
@@ -63,9 +84,22 @@ fn run(control: Arc<SessionControl>, stop: Arc<AtomicBool>) {
     let mut delay = DelayLine::default();
     let mut fader = Fader::default();
     let mut listeners = 0_u32;
+    let mut last_ping = Instant::now();
+    let mut empty_runs = 0_u32;
+    let mut last_l = 0.0_f32;
+    let mut last_r = 0.0_f32;
+    let mut last_room = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
+    let mut last_stat = String::new();
     while !stop.load(Ordering::Acquire) {
         let lan_n = hub.prune_and_count();
         control.set_lan_listeners(lan_n);
+        let announce = last_room.elapsed() >= Duration::from_millis(400);
+        if announce {
+            hub.broadcast_text(&room_json(&control, lan_n, hub.port()));
+            last_room = Instant::now();
+        }
         if !control.linked() || !is_sender(control.role()) {
             control.set_web_ok(false);
             control.set_web_silent(false);
@@ -73,10 +107,13 @@ fn run(control: Arc<SessionControl>, stop: Arc<AtomicBool>) {
             socket = None;
             last_claim.clear();
             last_cfg.clear();
+            last_stat.clear();
             listeners = 0;
+            p2p.clear();
             dtx = Dtx::default();
             delay = DelayLine::default();
             fader = Fader::default();
+            empty_runs = 0;
             thread::sleep(Duration::from_millis(80));
             continue;
         }
@@ -89,7 +126,10 @@ fn run(control: Arc<SessionControl>, stop: Arc<AtomicBool>) {
             thread::sleep(Duration::from_millis(80));
             continue;
         }
-        let port = control.bind_port();
+        let port = control
+            .snapshot()
+            .local_port
+            .unwrap_or_else(|| control.bind_port());
         let settings = control.codec_settings();
         let pass = control.password_hex();
         let device_rate = control.device_rate_hz();
@@ -110,13 +150,12 @@ fn run(control: Arc<SessionControl>, stop: Arc<AtomicBool>) {
                 .is_ok()
                 {
                     last_claim = key;
-                    last_cfg = cfg_json(settings, device_rate, block);
+                    last_cfg = cfg_json(settings, port, hub.port());
                     socket = None;
                     claim_backoff = Duration::from_secs(2);
                 } else {
-                    thread::sleep(claim_backoff);
                     claim_backoff = (claim_backoff * 2).min(Duration::from_secs(60));
-                    continue;
+                    thread::sleep(claim_backoff.min(Duration::from_millis(80)));
                 }
             }
             if socket.is_none() && last_ws_try.elapsed() >= ws_backoff {
@@ -129,31 +168,59 @@ fn run(control: Arc<SessionControl>, stop: Arc<AtomicBool>) {
                 }
             }
             if let Some(ws) = socket.as_mut() {
-                let cfg = cfg_json(settings, device_rate, block);
+                let cfg = cfg_json(settings, port, hub.port());
                 if cfg != last_cfg && send_keep(ws, Message::Text(cfg.clone().into())) {
                     last_cfg = cfg;
                 }
             }
-            if let Some(ws) = socket.as_mut() {
-                if !service_socket(ws, &mut listeners) {
-                    socket = None;
-                }
+            let sending_pcm = listeners > 0 && !control.web_silent();
+            let mut inbound = Vec::new();
+            if !keep_socket(
+                &mut socket,
+                &mut listeners,
+                &mut last_ping,
+                sending_pcm,
+                &mut inbound,
+            ) {
+                socket = None;
+                last_cfg.clear();
+                last_stat.clear();
             }
+            flush_p2p(
+                &mut p2p,
+                &mut socket,
+                &inbound,
+                &mut last_cfg,
+                &mut last_stat,
+            );
+            listeners = p2p.peer_count();
             control.set_web_listeners(listeners);
             control.set_web_ok(socket.is_some());
+            if let Some(ws) = socket.as_mut() {
+                let stat = stat_json(&control, &p2p, lan_n);
+                if stat != last_stat && send_keep(ws, Message::Text(stat.clone().into())) {
+                    last_stat = stat;
+                }
+            }
         } else {
             socket = None;
             last_claim.clear();
+            last_cfg.clear();
+            last_stat.clear();
             listeners = 0;
+            p2p.clear();
             control.set_web_ok(false);
             control.set_web_silent(false);
             control.set_web_listeners(0);
         }
+        let wake = control.take_web_wake();
         match control.take_pcm_live(WEB_BATCH_SAMPLES, KEEP_SAMPLES) {
             Ok(pcm) if pcm.len() >= 480 => {
+                empty_runs = 0;
                 let Some(outgoing) = delay.push(pcm) else {
                     continue;
                 };
+                remember_tail(&outgoing, &mut last_l, &mut last_r);
                 if lan_n > 0 {
                     lan_seq = lan_seq.wrapping_add(1);
                     hub.broadcast_bin(&encode_frame(lan_seq, &outgoing));
@@ -161,54 +228,182 @@ fn run(control: Arc<SessionControl>, stop: Arc<AtomicBool>) {
                 if listeners == 0 || !control.web_wanted() {
                     dtx = Dtx::default();
                     fader = Fader::default();
-                    control.set_web_silent(listeners == 0);
+                    control.set_web_silent(false);
                 } else {
-                    let event =
-                        dtx.push(is_silent(&outgoing), delay.future_silent(), fader.is_done());
-                    let mut frame = outgoing;
-                    match event {
-                        DtxEvent::FadeOut => fader.start_out(),
-                        DtxEvent::FadeIn => {
-                            if let Some(ws) = socket.as_mut() {
-                                let _ = send_keep(ws, Message::Text(r#"{"t":"go"}"#.into()));
-                            }
-                            fader.start_in();
-                        }
-                        DtxEvent::Hold => {}
-                        DtxEvent::Speak => {}
-                    }
-                    if event != DtxEvent::Hold {
-                        fader.apply(&mut frame);
-                        send_pcm(&mut socket, &mut seq, &frame);
-                        if dtx.phase == DtxPhase::FadingOut && fader.is_done() {
-                            if let Some(ws) = socket.as_mut() {
-                                let _ = send_keep(ws, Message::Text(r#"{"t":"dtx"}"#.into()));
-                            }
-                            dtx.phase = DtxPhase::Held;
-                            dtx.held = true;
-                        }
-                    }
-                    control.set_web_silent(dtx.held);
+                    p2p.push_pcm(&outgoing, control.bitrate_kbps());
+                    control.set_web_silent(false);
                 }
                 control.set_web_ok(socket.is_some());
             }
-            _ => thread::sleep(Duration::from_millis(8)),
+            _ => {
+                empty_runs = empty_runs.saturating_add(1);
+                if listeners > 0
+                    && control.web_wanted()
+                    && empty_runs >= STARVE_EMPTY
+                    && !dtx.held
+                    && (last_l.abs() > SILENCE_PEAK
+                        || last_r.abs() > SILENCE_PEAK
+                        || !dtx.is_idle())
+                {
+                    let mut outgoing = fade_from_last(last_l, last_r);
+                    last_l = 0.0;
+                    last_r = 0.0;
+                    fader.start_out();
+                    fader.apply(&mut outgoing);
+                    send_pcm(&mut socket, &mut seq, &outgoing);
+                    if let Some(ws) = socket.as_mut() {
+                        let _ = send_keep(ws, Message::Text(r#"{"t":"dtx"}"#.into()));
+                    }
+                    dtx.phase = DtxPhase::Held;
+                    dtx.held = true;
+                    dtx.silent_run = HANGOVER_FRAMES;
+                    control.set_web_silent(true);
+                } else if wake && dtx.held {
+                    dtx.force_wake();
+                    if let Some(ws) = socket.as_mut() {
+                        let _ = send_keep(ws, Message::Text(r#"{"t":"go"}"#.into()));
+                    }
+                    control.set_web_silent(false);
+                }
+                let mut inbound = Vec::new();
+                if !keep_socket(
+                    &mut socket,
+                    &mut listeners,
+                    &mut last_ping,
+                    false,
+                    &mut inbound,
+                ) {
+                    socket = None;
+                    last_cfg.clear();
+                    last_stat.clear();
+                }
+                flush_p2p(
+                    &mut p2p,
+                    &mut socket,
+                    &inbound,
+                    &mut last_cfg,
+                    &mut last_stat,
+                );
+                control.set_web_ok(socket.is_some());
+                thread::sleep(Duration::from_millis(8));
+            }
         }
     }
 }
 
-fn claim_key(slug: &str, port: u16, settings: CodecSettings, pass: &str, lan_http: u16) -> String {
-    format!(
-        "{slug}|{port}|{lan_http}|{}|{}|{}|{pass}",
-        settings.codec().as_str(),
-        settings.bitrate_kbps().unwrap_or(0),
-        settings.flac_level().unwrap_or(0)
-    )
+fn apply_web_frame(
+    socket: &mut Option<CloudSocket>,
+    seq: &mut u32,
+    dtx: &mut Dtx,
+    fader: &mut Fader,
+    outgoing: Vec<f32>,
+    ahead_silent: bool,
+    wake: bool,
+) {
+    let event = dtx.push(is_silent(&outgoing), ahead_silent, fader.is_done(), wake);
+    let mut frame = outgoing;
+    match event {
+        DtxEvent::FadeOut => fader.start_out(),
+        DtxEvent::FadeIn => {
+            if let Some(ws) = socket.as_mut() {
+                let _ = send_keep(ws, Message::Text(r#"{"t":"go"}"#.into()));
+            }
+            if fader.is_fading_out() {
+                fader.reverse();
+            } else {
+                fader.start_in();
+            }
+        }
+        DtxEvent::Hold | DtxEvent::Speak => {}
+    }
+    if event != DtxEvent::Hold {
+        fader.apply(&mut frame);
+        send_pcm(socket, seq, &frame);
+        if dtx.phase == DtxPhase::FadingOut && fader.is_done() {
+            if let Some(ws) = socket.as_mut() {
+                let _ = send_keep(ws, Message::Text(r#"{"t":"dtx"}"#.into()));
+            }
+            dtx.phase = DtxPhase::Held;
+            dtx.held = true;
+        }
+    }
 }
 
-fn cfg_json(settings: CodecSettings, device_rate: u32, block: u32) -> String {
+fn flush_p2p(
+    p2p: &mut crate::p2p::Hub,
+    socket: &mut Option<CloudSocket>,
+    inbound: &[String],
+    last_cfg: &mut String,
+    last_stat: &mut String,
+) {
+    let mut outbound = Vec::new();
+    p2p.apply_all(inbound, &mut outbound);
+    p2p.drive(&mut outbound);
+    let Some(ws) = socket.as_mut() else {
+        return;
+    };
+    for msg in outbound {
+        if !send_keep(ws, Message::Text(msg.into())) {
+            *socket = None;
+            last_cfg.clear();
+            last_stat.clear();
+            return;
+        }
+    }
+}
+
+fn keep_socket(
+    socket: &mut Option<CloudSocket>,
+    listeners: &mut u32,
+    last_ping: &mut Instant,
+    sending_pcm: bool,
+    inbound: &mut Vec<String>,
+) -> bool {
+    let Some(ws) = socket.as_mut() else {
+        return false;
+    };
+    if !sending_pcm && last_ping.elapsed() >= PING_EVERY {
+        if !send_keep(ws, Message::Ping(Vec::new().into())) {
+            return false;
+        }
+        *last_ping = Instant::now();
+    }
+    service_socket(ws, listeners, inbound)
+}
+
+fn remember_tail(pcm: &[f32], last_l: &mut f32, last_r: &mut f32) {
+    if pcm.len() >= 2 {
+        *last_l = pcm[pcm.len() - 2];
+        *last_r = pcm[pcm.len() - 1];
+    }
+}
+
+fn fade_from_last(last_l: f32, last_r: f32) -> Vec<f32> {
+    let frames = WEB_BATCH_SAMPLES / 2;
+    let mut out = vec![0.0; WEB_BATCH_SAMPLES];
+    for i in 0..frames {
+        let t = (i + 1) as f32 / frames as f32;
+        let shaped = 0.5 - 0.5 * (core::f32::consts::PI * t).cos();
+        let gain = 1.0 - shaped;
+        out[i * 2] = last_l * gain;
+        out[i * 2 + 1] = last_r * gain;
+    }
+    out
+}
+
+fn claim_key(
+    slug: &str,
+    _port: u16,
+    _settings: CodecSettings,
+    pass: &str,
+    lan_http: u16,
+) -> String {
+    format!("{slug}|{lan_http}|{pass}")
+}
+
+fn cfg_json(settings: CodecSettings, port: u16, lan_http: u16) -> String {
     format!(
-        "{{\"t\":\"cfg\",\"codec\":\"{}\",\"bitrate\":{},\"bits\":{},\"compression\":{},\"rate\":48000,\"deviceRate\":{device_rate},\"block\":{block}}}",
+        "{{\"t\":\"cfg\",\"codec\":\"{}\",\"bitrate\":{},\"bits\":{},\"compression\":{},\"rate\":48000,\"port\":{port},\"lanHttp\":{lan_http}}}",
         settings.codec().as_str(),
         settings.bitrate_kbps().unwrap_or(0),
         settings.bits().max(WIRE_BITS),
@@ -241,21 +436,51 @@ enum DtxPhase {
 struct Dtx {
     phase: DtxPhase,
     held: bool,
+    silent_run: u32,
 }
 
 impl Dtx {
+    fn is_idle(&self) -> bool {
+        matches!(self.phase, DtxPhase::Live) && self.silent_run == 0
+    }
+
+    fn force_wake(&mut self) {
+        self.phase = DtxPhase::Live;
+        self.held = false;
+        self.silent_run = 0;
+    }
+
     /// `now` is the delayed frame about to go on the wire. `ahead` is true
     /// when the next ~40 ms is also below the silence floor.
-    fn push(&mut self, now_silent: bool, ahead_silent: bool, fade_done: bool) -> DtxEvent {
+    fn push(
+        &mut self,
+        now_silent: bool,
+        ahead_silent: bool,
+        fade_done: bool,
+        wake: bool,
+    ) -> DtxEvent {
+        if now_silent {
+            self.silent_run = self.silent_run.saturating_add(1);
+        } else {
+            self.silent_run = 0;
+        }
         match self.phase {
             DtxPhase::Live => {
-                if ahead_silent {
+                if wake {
+                    return DtxEvent::Speak;
+                }
+                if now_silent && ahead_silent && self.silent_run >= HANGOVER_FRAMES {
                     self.phase = DtxPhase::FadingOut;
                     return DtxEvent::FadeOut;
                 }
                 DtxEvent::Speak
             }
             DtxPhase::FadingOut => {
+                if wake || !now_silent {
+                    self.phase = DtxPhase::FadingIn;
+                    self.held = false;
+                    return DtxEvent::FadeIn;
+                }
                 if fade_done {
                     self.phase = DtxPhase::Held;
                     self.held = true;
@@ -264,12 +489,12 @@ impl Dtx {
                 DtxEvent::Speak
             }
             DtxPhase::Held => {
-                if now_silent {
-                    return DtxEvent::Hold;
+                if wake || !now_silent {
+                    self.phase = DtxPhase::FadingIn;
+                    self.held = false;
+                    return DtxEvent::FadeIn;
                 }
-                self.phase = DtxPhase::FadingIn;
-                self.held = false;
-                DtxEvent::FadeIn
+                DtxEvent::Hold
             }
             DtxPhase::FadingIn => {
                 if fade_done {
@@ -313,6 +538,18 @@ impl Fader {
 
     fn is_done(&self) -> bool {
         self.dir == 0 || self.remaining <= 0
+    }
+
+    fn is_fading_out(&self) -> bool {
+        self.dir < 0 && self.remaining > 0
+    }
+
+    fn reverse(&mut self) {
+        if self.dir >= 0 || self.remaining <= 0 {
+            return;
+        }
+        self.remaining = self.total.saturating_sub(self.remaining);
+        self.dir = 1;
     }
 
     #[cfg(test)]
@@ -416,7 +653,7 @@ fn configure_socket(ws: &mut CloudSocket) {
 }
 
 /// Drain incoming frames. Listener count arrives as room events — no HTTP.
-fn service_socket(ws: &mut CloudSocket, listeners: &mut u32) -> bool {
+fn service_socket(ws: &mut CloudSocket, listeners: &mut u32, inbound: &mut Vec<String>) -> bool {
     loop {
         match ws.read() {
             Ok(Message::Ping(payload)) => {
@@ -427,6 +664,9 @@ fn service_socket(ws: &mut CloudSocket, listeners: &mut u32) -> bool {
             Ok(Message::Text(text)) => {
                 if let Some(n) = parse_listeners(text.as_str()) {
                     *listeners = n;
+                }
+                if is_rtc_signal(text.as_str()) {
+                    inbound.push(text.to_string());
                 }
             }
             Ok(Message::Close(_)) => return false,
@@ -496,6 +736,39 @@ fn encode_frame(seq: u32, pcm: &[f32]) -> Vec<u8> {
     bytes
 }
 
+fn room_json(control: &SessionControl, lan_n: u32, lan_http: u16) -> String {
+    let snap = control.snapshot();
+    let live = lan_n > 0 || snap.peers > 0 || control.web_listeners() > 0;
+    format!(
+        "{{\"t\":\"room\",\"host\":true,\"live\":{live},\"silent\":{},\"listeners\":{lan_n},\"peers\":{},\"dropouts\":{},\"port\":{lan_http},\"asleep\":{}}}",
+        control.web_silent(),
+        snap.peers,
+        snap.dropouts,
+        control.web_silent()
+    )
+}
+
+fn stat_json(control: &SessionControl, p2p: &crate::p2p::Hub, lan_n: u32) -> String {
+    let snap = control.snapshot();
+    format!(
+        "{{\"t\":\"stat\",\"dropouts\":{},\"peers\":{},\"lan\":{lan_n},\"web\":{},\"ready\":{},\"sent\":{},\"peak\":{},\"port\":{}}}",
+        snap.dropouts,
+        snap.peers,
+        p2p.peer_count(),
+        p2p.ready_count(),
+        p2p.frames_sent(),
+        format!("{:.3}", p2p.last_peak()),
+        snap.local_port.unwrap_or(0)
+    )
+}
+
+fn is_rtc_signal(body: &str) -> bool {
+    body.contains("\"t\":\"want\"")
+        || body.contains("\"t\":\"answer\"")
+        || body.contains("\"t\":\"ice\"")
+        || body.contains("\"t\":\"bye\"")
+}
+
 fn parse_listeners(body: &str) -> Option<u32> {
     let key = "\"listeners\":";
     let rest = body.split(key).nth(1)?;
@@ -517,6 +790,38 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "hits production relay.matari-audio.com"]
+    fn live_cloud_claim_and_in_socket() {
+        let slug = format!(
+            "diag-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(1)
+        );
+        let settings = relay_session::CodecSettings::live();
+        super::claim(
+            &ureq::AgentBuilder::new()
+                .timeout(std::time::Duration::from_secs(4))
+                .user_agent("Mozilla/5.0 RELAY/diag")
+                .build(),
+            &slug,
+            17_492,
+            settings,
+            "",
+            48_000,
+            128,
+            8_787,
+        )
+        .expect("ureq claim against relay.matari-audio.com");
+        let socket = super::open_in(&slug);
+        assert!(
+            socket.is_some(),
+            "tungstenite rustls /in must open (same crates as the plugin fan-out)"
+        );
+    }
+
+    #[test]
     fn encode_frame_has_magic_and_seq() {
         let bytes = super::encode_frame(7, &[0.0, 0.5]);
         assert_eq!(&bytes[..4], b"RLY1");
@@ -525,13 +830,14 @@ mod tests {
     }
 
     #[test]
-    fn claim_key_ignores_host_block() {
+    fn claim_key_is_room_identity() {
         let settings = relay_session::CodecSettings::live();
         let a = super::claim_key("mix", 17492, settings, "", 8787);
-        let b = super::claim_key("mix", 17492, settings, "", 8787);
+        let b = super::claim_key("mix", 18000, settings, "", 8787);
         assert_eq!(a, b);
-        assert!(!a.contains("128"));
-        assert!(!a.contains("44100"));
+        assert!(!a.contains("17492"));
+        assert!(!a.contains("opus"));
+        assert!(!a.contains("192"));
     }
 
     #[test]
@@ -542,16 +848,50 @@ mod tests {
     }
 
     #[test]
-    fn dtx_fades_out_when_silence_is_ahead() {
+    fn dtx_ignores_short_quiet_gaps() {
         let mut dtx = super::Dtx::default();
-        assert_eq!(dtx.push(false, false, true), super::DtxEvent::Speak);
-        assert_eq!(dtx.push(false, true, true), super::DtxEvent::FadeOut);
-        assert_eq!(dtx.push(true, true, false), super::DtxEvent::Speak);
-        assert_eq!(dtx.push(true, true, true), super::DtxEvent::Hold);
-        assert_eq!(dtx.push(true, true, true), super::DtxEvent::Hold);
-        assert_eq!(dtx.push(false, false, true), super::DtxEvent::FadeIn);
-        assert_eq!(dtx.push(false, false, false), super::DtxEvent::Speak);
-        assert_eq!(dtx.push(false, false, true), super::DtxEvent::Speak);
+        assert_eq!(dtx.push(false, false, true, false), super::DtxEvent::Speak);
+        for _ in 0..super::HANGOVER_FRAMES - 1 {
+            assert_eq!(dtx.push(true, true, true, false), super::DtxEvent::Speak);
+        }
+        assert_eq!(dtx.push(false, false, true, false), super::DtxEvent::Speak);
+    }
+
+    #[test]
+    fn dtx_fades_out_after_hangover() {
+        let mut dtx = super::Dtx::default();
+        for _ in 0..super::HANGOVER_FRAMES - 1 {
+            assert_eq!(dtx.push(true, true, true, false), super::DtxEvent::Speak);
+        }
+        assert_eq!(dtx.push(true, true, true, false), super::DtxEvent::FadeOut);
+        assert_eq!(dtx.push(true, true, false, false), super::DtxEvent::Speak);
+        assert_eq!(dtx.push(true, true, true, false), super::DtxEvent::Hold);
+        assert_eq!(dtx.push(true, true, true, false), super::DtxEvent::Hold);
+        assert_eq!(dtx.push(false, false, true, false), super::DtxEvent::FadeIn);
+        assert_eq!(dtx.push(false, false, false, false), super::DtxEvent::Speak);
+        assert_eq!(dtx.push(false, false, true, false), super::DtxEvent::Speak);
+    }
+
+    #[test]
+    fn dtx_aborts_fade_out_when_audio_returns() {
+        let mut dtx = super::Dtx::default();
+        for _ in 0..super::HANGOVER_FRAMES {
+            let _ = dtx.push(true, true, true, false);
+        }
+        assert_eq!(dtx.phase, super::DtxPhase::FadingOut);
+        assert_eq!(
+            dtx.push(false, false, false, false),
+            super::DtxEvent::FadeIn
+        );
+    }
+
+    #[test]
+    fn dtx_wake_leaves_hold() {
+        let mut dtx = super::Dtx::default();
+        dtx.phase = super::DtxPhase::Held;
+        dtx.held = true;
+        assert_eq!(dtx.push(true, true, true, true), super::DtxEvent::FadeIn);
+        assert!(!dtx.held);
     }
 
     #[test]
@@ -586,11 +926,38 @@ mod tests {
     }
 
     #[test]
+    fn fader_reverse_continues_from_current_gain() {
+        let mut fader = super::Fader::default();
+        fader.start_out();
+        let mut first = vec![1.0_f32; 64];
+        fader.apply(&mut first);
+        let at_reverse = first[63];
+        assert!(fader.is_fading_out());
+        fader.reverse();
+        let mut next = vec![1.0_f32; 64];
+        fader.apply(&mut next);
+        assert!(next[0] > 0.0);
+        assert!((next[0] - at_reverse).abs() < 0.15);
+        assert!(next[63] > next[0]);
+    }
+
+    #[test]
+    fn fade_from_last_starts_near_tail() {
+        let pcm = super::fade_from_last(0.8, -0.4);
+        assert!((pcm[0] - 0.8).abs() < 0.05);
+        assert!((pcm[1] + 0.4).abs() < 0.05);
+        assert!(pcm[pcm.len() - 2].abs() < 0.05);
+        assert!(pcm[pcm.len() - 1].abs() < 0.05);
+    }
+
+    #[test]
     fn cfg_json_names_codec() {
-        let json = super::cfg_json(relay_session::CodecSettings::live(), 48_000, 256);
+        let json = super::cfg_json(relay_session::CodecSettings::live(), 17_492, 8787);
         assert!(json.contains("\"t\":\"cfg\""));
         assert!(json.contains("\"codec\":\"opus\""));
-        assert!(json.contains("\"block\":256"));
+        assert!(json.contains("\"port\":17492"));
+        assert!(!json.contains("deviceRate"));
+        assert!(!json.contains("\"block\""));
     }
 
     #[test]

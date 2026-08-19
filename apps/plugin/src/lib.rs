@@ -7,6 +7,7 @@ use relay_audio::FrameDuration;
 mod editor;
 mod fanout;
 mod local_listen;
+mod p2p;
 
 use relay_session::{
     DEFAULT_CONNECT_PORT, MonitorMode, SessionConfig, SessionControl, SessionRole, SessionRuntime,
@@ -21,9 +22,9 @@ use editor::{RelayUi, buffr_visuals};
 use RelayParamsParamId as P;
 
 pub(crate) const WINDOW_W: u32 = 428;
-pub(crate) const WINDOW_H: u32 = 420;
+pub(crate) const WINDOW_H: u32 = 400;
 pub(crate) const MIN_WINDOW_W: u32 = 380;
-pub(crate) const MIN_WINDOW_H: u32 = 320;
+pub(crate) const MIN_WINDOW_H: u32 = 380;
 pub(crate) const MAX_WINDOW_W: u32 = 560;
 pub(crate) const MAX_WINDOW_H: u32 = 720;
 pub(crate) const METER_FLOOR_DB: f32 = -60.0;
@@ -71,11 +72,11 @@ impl Monitor {
 
 #[derive(ParamEnum)]
 pub enum Codec {
-    #[name = "Opus · 192 kbps"]
+    #[name = "Opus"]
     Opus,
-    #[name = "FLAC · 16-bit"]
+    #[name = "FLAC"]
     Flac,
-    #[name = "PCM · 16-bit LAN"]
+    #[name = "PCM · LAN"]
     Pcm,
 }
 
@@ -109,12 +110,42 @@ impl Default for SessionPersist {
     }
 }
 
+const SLUG_ADJECTIVES: &[&str] = &[
+    "big", "filthy", "quiet", "late", "warm", "cold", "loud", "soft", "bright", "dark", "wild",
+    "rusty", "dusty", "sweet", "heavy", "light", "sharp", "empty", "slow", "fast", "deep", "thin",
+    "wide", "tiny", "pale", "dry", "calm", "raw", "odd", "bold", "hot", "cool", "flat", "polar",
+    "lunar", "storm", "still", "vivid", "mute", "gold",
+];
+
+const SLUG_NOUNS: &[&str] = &[
+    "papaya", "mango", "cedar", "maple", "river", "stone", "fox", "wolf", "moth", "ember", "comet",
+    "harbor", "attic", "kettle", "drum", "piano", "socket", "buffer", "fader", "meter", "booth",
+    "desk", "lamp", "tape", "reel", "stem", "gate", "plate", "spring", "orchid", "canyon",
+    "glacier", "meadow", "velvet", "copper", "quartz",
+];
+
 pub(crate) fn new_slug() -> String {
-    let nanos = std::time::SystemTime::now()
+    let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or(1);
-    format!("room-{:x}", (nanos % 0x0000_ffff_ffff) as u32)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or(1)
+        ^ u64::from(std::process::id()).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    let n_adj = SLUG_ADJECTIVES.len() as u64;
+    let n_noun = SLUG_NOUNS.len() as u64;
+    let a = (z % n_adj) as usize;
+    let mut b = ((z / n_adj) % n_adj) as usize;
+    let c = ((z / n_adj / n_adj) % n_noun) as usize;
+    if b == a {
+        b = (b + 1) % SLUG_ADJECTIVES.len();
+    }
+    format!(
+        "{}-{}-{}",
+        SLUG_ADJECTIVES[a], SLUG_ADJECTIVES[b], SLUG_NOUNS[c]
+    )
 }
 
 #[derive(Params)]
@@ -122,7 +153,7 @@ pub struct RelayParams {
     #[param(name = "Product")]
     pub product: EnumParam<Product>,
 
-    #[param(name = "Monitor")]
+    #[param(name = "Monitor", default = 1)]
     pub monitor: EnumParam<Monitor>,
 
     #[param(name = "Codec")]
@@ -142,7 +173,7 @@ pub struct RelayParams {
     #[param(name = "Live", default = 1)]
     pub link: BoolParam,
 
-    #[param(name = "Web", default = 0)]
+    #[param(name = "Web", default = 1)]
     pub web: BoolParam,
 
     #[param(name = "Port", range = "discrete(1, 65535)", default = 17_492)]
@@ -190,6 +221,8 @@ pub struct RelayDsp {
     interleaved: Vec<f32>,
     dry: Vec<f32>,
     output: Vec<f32>,
+    hear_latency: u32,
+    device_rate: u32,
 }
 
 impl Default for RelayDsp {
@@ -201,6 +234,8 @@ impl Default for RelayDsp {
             interleaved: Vec::new(),
             dry: Vec::new(),
             output: Vec::new(),
+            hear_latency: 0,
+            device_rate: 0,
         }
     }
 }
@@ -209,7 +244,7 @@ impl PluginLogic for RelayPlugin {
     type Params = RelayParams;
     type DspState = RelayDsp;
 
-    const PRESERVE_DSP_STATE: bool = false;
+    const PRESERVE_DSP_STATE: bool = true;
 
     fn bus_layouts() -> Vec<BusLayout> {
         BusLayout::stereo_and_mono()
@@ -225,19 +260,26 @@ impl PluginLogic for RelayPlugin {
             .saturating_mul(2)
             .max(2)
             .min(MAX_INTERLEAVED);
-        state.interleaved.resize(samples, 0.0);
-        state.dry.resize(samples, 0.0);
-        state.output.resize(samples, 0.0);
-        state.runtime = None;
-        if let Some(stop) = state.fanout_stop.take() {
-            stop.store(true, std::sync::atomic::Ordering::Release);
+        if state.interleaved.len() < samples {
+            state.interleaved.resize(samples, 0.0);
+            state.dry.resize(samples, 0.0);
+            state.output.resize(samples, 0.0);
         }
-        state.fanout = None;
         let rate = config.sample_rate.round().clamp(8_000.0, 192_000.0) as usize;
         params.control.set_device_rate_hz(rate as u32);
         params
             .control
             .set_block_frames(config.max_block_size.min(u32::MAX as usize) as u32);
+        if state.runtime.is_some() && state.device_rate == rate as u32 {
+            ensure_fanout(state, params);
+            return;
+        }
+        state.runtime = None;
+        if let Some(stop) = state.fanout_stop.take() {
+            stop.store(true, std::sync::atomic::Ordering::Release);
+        }
+        state.fanout = None;
+        state.device_rate = rate as u32;
         let prepared = SessionRuntime::start_with(
             SessionConfig {
                 mode: params.product.value().role().session_mode(),
@@ -250,15 +292,26 @@ impl PluginLogic for RelayPlugin {
             Arc::clone(&params.control),
         );
         if let Ok(runtime) = prepared {
+            params.control.clear_last_error();
+            state.hear_latency = if params.product.value().is_link() {
+                0
+            } else {
+                runtime.playback_target_frames()
+            };
             state.runtime = Some(runtime);
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             state.fanout_stop = Some(Arc::clone(&stop));
             state.fanout = Some(fanout::spawn(Arc::clone(&params.control), stop));
+        } else {
+            state.hear_latency = 0;
+            params
+                .control
+                .set_last_error("session engine failed to start");
         }
     }
 
-    fn latency(_state: &RelayDsp) -> u32 {
-        0
+    fn latency(state: &RelayDsp) -> u32 {
+        state.hear_latency
     }
 
     fn process(
@@ -269,11 +322,12 @@ impl PluginLogic for RelayPlugin {
         context: &mut ProcessContext,
     ) -> ProcessStatus {
         params.control.set_linked(params.link.value());
-        params.control.set_web_wanted(params.web.value());
+        params.control.set_web_wanted(true);
         params.control.set_role(params.product.value().role());
         params.control.set_codec(params.codec.value().wire());
-        params.bitrate.set_value(192);
-        params.control.set_bitrate_kbps(192);
+        params
+            .control
+            .set_bitrate_kbps(params.bitrate.value().clamp(64, 256) as u32);
         params
             .control
             .set_flac_level(params.flac_level.value() as u8);
@@ -283,42 +337,55 @@ impl PluginLogic for RelayPlugin {
 
         let frames = buffer.num_samples();
         let needed = frames.saturating_mul(2);
-        if needed == 0 || needed > state.interleaved.len() {
+        if needed == 0 {
+            return ProcessStatus::Normal;
+        }
+        if needed > state.interleaved.len() {
+            host_passthrough(buffer, frames);
             return ProcessStatus::Normal;
         }
 
         copy_inputs(buffer, frames, &mut state.interleaved[..needed]);
         state.dry[..needed].copy_from_slice(&state.interleaved[..needed]);
 
-        let input_gain = db_to_linear(params.input_gain.read());
+        let input_gain = db_to_linear(params.input_gain.read_after(frames));
         for sample in &mut state.interleaved[..needed] {
             *sample *= input_gain;
         }
 
         let linking = params.product.value().is_link();
-        let monitor = if linking {
-            MonitorMode::Dry
-        } else {
-            MonitorMode::Remote
-        };
-        if let Some(runtime) = state.runtime.as_mut() {
-            runtime.set_monitor(monitor);
+        let rendered = if let Some(runtime) = state.runtime.as_mut() {
+            runtime.set_monitor(MonitorMode::Remote);
             let _ = runtime.process_capture(&state.interleaved[..needed]);
-            let _ = runtime.render(&mut state.output[..needed], &state.dry[..needed]);
+            runtime
+                .render(&mut state.output[..needed], &state.dry[..needed])
+                .rendered_samples
         } else {
-            state.output[..needed].copy_from_slice(&state.dry[..needed]);
-        }
-
-        let hear = db_to_linear(params.output_gain.read());
-        let mixed = if linking {
-            &mut state.dry[..needed]
-        } else {
-            &mut state.output[..needed]
+            state.output[..needed].fill(0.0);
+            0
         };
-        for sample in mixed.iter_mut() {
-            *sample *= hear;
+
+        if linking {
+            write_outputs(buffer, frames, &state.dry[..needed]);
+        } else {
+            let hear = db_to_linear(params.output_gain.read_after(frames));
+            for sample in &mut state.output[..needed] {
+                *sample *= hear;
+            }
+            match params.monitor.value() {
+                Monitor::Dry => write_outputs(buffer, frames, &state.dry[..needed]),
+                Monitor::Remote => {
+                    if rendered < needed {
+                        splice_dry(&mut state.output[..needed], &state.dry[..needed], rendered);
+                    }
+                    write_outputs(buffer, frames, &state.output[..needed]);
+                }
+                Monitor::Mix => {
+                    mix_into(&mut state.output[..needed], &state.dry[..needed]);
+                    write_outputs(buffer, frames, &state.output[..needed]);
+                }
+            }
         }
-        write_outputs(buffer, frames, mixed);
 
         let (send_l, send_r) = stereo_peaks(&state.interleaved[..needed]);
         context.set_meter(P::MeterLeft, send_l);
@@ -372,12 +439,31 @@ fn db_to_pos(db: f32) -> f32 {
     ((db.clamp(METER_FLOOR_DB, 0.0) - METER_FLOOR_DB) / -METER_FLOOR_DB).clamp(0.0, 1.0)
 }
 
+fn ensure_fanout(state: &mut RelayDsp, params: &RelayParams) {
+    let dead = state
+        .fanout
+        .as_ref()
+        .is_none_or(|handle| handle.is_finished());
+    if !dead {
+        return;
+    }
+    if let Some(stop) = state.fanout_stop.take() {
+        stop.store(true, std::sync::atomic::Ordering::Release);
+    }
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    state.fanout_stop = Some(Arc::clone(&stop));
+    state.fanout = Some(fanout::spawn(Arc::clone(&params.control), stop));
+}
+
 pub(crate) fn publish_control(params: &RelayParams) {
     params.control.set_linked(params.link.value());
+    params.web.set_value(true);
+    params.control.set_web_wanted(true);
     params.control.set_role(params.product.value().role());
     params.control.set_codec(params.codec.value().wire());
-    params.bitrate.set_value(192);
-    params.control.set_bitrate_kbps(192);
+    params
+        .control
+        .set_bitrate_kbps(params.bitrate.value().clamp(64, 256) as u32);
     params
         .control
         .set_flac_level(params.flac_level.value() as u8);
@@ -428,6 +514,72 @@ fn write_outputs(buffer: &mut AudioBuffer, frames: usize, interleaved: &[f32]) {
     }
 }
 
+fn mix_into(dst: &mut [f32], dry: &[f32]) {
+    for (sample, dry_sample) in dst.iter_mut().zip(dry) {
+        *sample += *dry_sample;
+    }
+}
+
+/// Fill a Remote-only hole with dry so an underrun is the local track, not silence.
+fn splice_dry(out: &mut [f32], dry: &[f32], rendered: usize) {
+    let rendered = rendered.min(out.len()).min(dry.len()) & !1;
+    if rendered == 0 {
+        let fade = 64.min(out.len() / 2);
+        for i in 0..fade {
+            let t = (i + 1) as f32 / fade as f32;
+            let g = 0.5 - 0.5 * (core::f32::consts::PI * t).cos();
+            let o = i * 2;
+            if o + 1 >= out.len() {
+                break;
+            }
+            out[o] = dry[o] * g;
+            out[o + 1] = dry[o + 1] * g;
+        }
+        if fade * 2 < out.len() {
+            out[fade * 2..].copy_from_slice(&dry[fade * 2..]);
+        }
+        return;
+    }
+    if rendered >= out.len() {
+        return;
+    }
+    let fade_frames = 32.min(rendered / 2).min((out.len() - rendered) / 2).max(1);
+    let fade_start = rendered.saturating_sub(fade_frames * 2);
+    for i in 0..fade_frames {
+        let t = (i + 1) as f32 / fade_frames as f32;
+        let g = 0.5 - 0.5 * (core::f32::consts::PI * t).cos();
+        let o = fade_start + i * 2;
+        out[o] = out[o] * (1.0 - g) + dry[o] * g;
+        out[o + 1] = out[o + 1] * (1.0 - g) + dry[o + 1] * g;
+    }
+    out[rendered..].copy_from_slice(&dry[rendered..]);
+}
+
+fn host_passthrough(buffer: &mut AudioBuffer, frames: usize) {
+    let inputs = buffer.num_input_channels();
+    let outputs = buffer.num_output_channels();
+    if outputs == 0 {
+        return;
+    }
+    if inputs == 0 {
+        for channel in 0..outputs {
+            let out = buffer.output(channel);
+            let n = frames.min(out.len());
+            out[..n].fill(0.0);
+        }
+        return;
+    }
+    for channel in 0..outputs {
+        let in_ch = channel.min(inputs - 1);
+        if buffer.is_in_place(channel) && in_ch == channel {
+            continue;
+        }
+        let (input, output) = buffer.io_pair(in_ch, channel);
+        let n = frames.min(input.len()).min(output.len());
+        output[..n].copy_from_slice(&input[..n]);
+    }
+}
+
 truce::plugin! {
     logic: RelayPlugin,
     params: RelayParams,
@@ -469,6 +621,22 @@ mod tests {
     }
 
     #[test]
+    fn link_passthrough_ignores_send_and_hear() {
+        use std::time::Duration;
+        use truce_test::{InputSource, assertions, driver};
+
+        let result = driver!(Plugin)
+            .set_param(P::InputGain, 1.0)
+            .set_param(P::OutputGain, 1.0)
+            .duration(Duration::from_millis(80))
+            .input(InputSource::Constant(0.25))
+            .run();
+        assertions::assert_no_nans(&result);
+        assertions::assert_nonzero(&result);
+        assertions::assert_peak_below(&result, 0.26);
+    }
+
+    #[test]
     fn process_is_allocation_free() {
         use std::time::Duration;
         use truce_test::{InputSource, assert_no_audio_alloc, driver};
@@ -478,6 +646,17 @@ mod tests {
                 .input(InputSource::Constant(0.25))
                 .run()
         });
+    }
+
+    /// LV2 wrapper glue must stay allocation-free on the audio thread.
+    #[cfg(feature = "lv2")]
+    #[test]
+    fn lv2_wrapper_glue_is_allocation_free() {
+        assert_eq!(
+            truce_lv2::rt_paranoid_smoke::<Plugin>(),
+            0,
+            "the LV2 wrapper's per-block glue must not allocate on the audio thread"
+        );
     }
 
     #[test]
@@ -520,9 +699,104 @@ mod tests {
         let params = RelayParams::new();
         assert!(params.product.value().is_link());
         assert!(params.link.value());
+        assert!(
+            params.web.value(),
+            "Share always offers the listen page; idle with nobody connected is a no-op"
+        );
         assert!(matches!(params.codec.value(), Codec::Opus));
         assert_eq!(params.bitrate.value(), 192);
+        assert!(matches!(params.monitor.value(), Monitor::Mix));
         assert!(!params.session.read().expect("lock").name.is_empty());
+    }
+
+    #[test]
+    fn publish_control_keeps_bitrate() {
+        let params = RelayParams::new();
+        params.bitrate.set_value(96);
+        publish_control(&params);
+        assert_eq!(params.bitrate.value(), 96);
+        assert_eq!(params.control.bitrate_kbps(), 96);
+    }
+
+    #[test]
+    fn connect_mix_keeps_dry_when_remote_is_silent() {
+        use std::time::Duration;
+        use truce_test::{InputSource, assertions, driver};
+
+        let result = driver!(Plugin)
+            .set_param(P::Product, 1.0)
+            .duration(Duration::from_millis(80))
+            .input(InputSource::Constant(0.25))
+            .run();
+        assertions::assert_no_nans(&result);
+        assertions::assert_nonzero(&result);
+        assertions::assert_peak_below(&result, 0.26);
+    }
+
+    #[test]
+    fn connect_remote_underrun_falls_back_to_dry() {
+        use std::time::Duration;
+        use truce_test::{InputSource, assertions, driver};
+
+        let result = driver!(Plugin)
+            .set_param(P::Product, 1.0)
+            .set_param(P::Monitor, 2.0)
+            .duration(Duration::from_millis(80))
+            .input(InputSource::Constant(0.25))
+            .run();
+        assertions::assert_no_nans(&result);
+        assertions::assert_nonzero(&result);
+        assertions::assert_peak_below(&result, 0.26);
+    }
+
+    #[test]
+    fn splice_dry_fills_a_silent_suffix() {
+        let mut out = vec![0.8; 192];
+        for sample in &mut out[128..] {
+            *sample = 0.0;
+        }
+        let dry = vec![0.1; 192];
+        splice_dry(&mut out, &dry, 128);
+        assert!((out[0] - 0.8).abs() < 1e-5);
+        assert!((out[190] - 0.1).abs() < 1e-5);
+        assert!((out[191] - 0.1).abs() < 1e-5);
+    }
+
+    #[test]
+    fn splice_dry_empty_remote_becomes_dry() {
+        let mut out = [0.0; 8];
+        let dry = [0.2; 8];
+        splice_dry(&mut out, &dry, 0);
+        assert!(out.iter().any(|s| *s > 0.05));
+        assert!((out[6] - 0.2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn publish_control_arms_web() {
+        let params = RelayParams::new();
+        params.web.set_value(true);
+        publish_control(&params);
+        assert!(
+            params.control.web_wanted(),
+            "web listen is always armed without waiting for process()"
+        );
+    }
+
+    #[test]
+    fn new_slug_is_three_real_words() {
+        let slug = new_slug();
+        let parts: Vec<_> = slug.split('-').collect();
+        assert_eq!(parts.len(), 3, "{slug}");
+        assert!(
+            SLUG_ADJECTIVES.contains(&parts[0]),
+            "unknown adjective in {slug}"
+        );
+        assert!(
+            SLUG_ADJECTIVES.contains(&parts[1]),
+            "unknown adjective in {slug}"
+        );
+        assert!(SLUG_NOUNS.contains(&parts[2]), "unknown noun in {slug}");
+        assert_ne!(parts[0], parts[1], "{slug}");
     }
 
     #[test]
@@ -549,5 +823,40 @@ mod tests {
         assert_eq!(frame_from_host(48_000, 512), FrameDuration::Ms10);
         assert_eq!(frame_from_host(48_000, 1024), FrameDuration::Ms20);
         assert_eq!(frame_from_host(44_100, 128), FrameDuration::Ms5);
+    }
+
+    #[test]
+    fn same_rate_reset_keeps_runtime() {
+        let params = RelayParams::new();
+        let mut state = RelayDsp::default();
+        let config = AudioConfig::new(48_000.0, 128);
+        RelayPlugin::reset(&mut state, &params, &config);
+        assert!(state.runtime.is_some());
+        let first = state
+            .runtime
+            .as_ref()
+            .map(|runtime| core::ptr::from_ref(runtime) as usize);
+        RelayPlugin::reset(&mut state, &params, &config);
+        let second = state
+            .runtime
+            .as_ref()
+            .map(|runtime| core::ptr::from_ref(runtime) as usize);
+        assert_eq!(first, second);
+        assert_eq!(state.device_rate, 48_000);
+    }
+
+    #[test]
+    fn rate_change_rebuilds_runtime() {
+        let params = RelayParams::new();
+        let mut state = RelayDsp::default();
+        RelayPlugin::reset(&mut state, &params, &AudioConfig::new(48_000.0, 128));
+        let before = NEXT_SSRC.load(Ordering::Relaxed);
+        RelayPlugin::reset(&mut state, &params, &AudioConfig::new(44_100.0, 128));
+        assert!(
+            NEXT_SSRC.load(Ordering::Relaxed) > before,
+            "a new session engine must take a fresh SSRC"
+        );
+        assert!(state.runtime.is_some());
+        assert_eq!(state.device_rate, 44_100);
     }
 }

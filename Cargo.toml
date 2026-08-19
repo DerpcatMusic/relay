@@ -13,6 +13,8 @@ members = [
     "crates/relay-session",
     "crates/relay-testkit",
     "crates/relay-transport",
+    "crates/relay-libdatachannel-sys",
+    "crates/relay-transport-libdatachannel",
     "apps/connect",
     "apps/stream",
     "apps/link",
@@ -24,6 +26,8 @@ resolver = "3"
 edition = "2024"
 rust-version = "1.92"
 license = "MPL-2.0"
+repository = "https://github.com/DerpcatMusic/relay"
+homepage = "https://relay.matari-audio.com"
 
 [workspace.dependencies]
 prost = "=0.14.4"

@@ -24,8 +24,6 @@ pub const FLAC_LEVEL_DEFAULT: u8 = 5;
 pub const FLAC_LEVEL_MAX: u8 = 8;
 
 /// How media is packed on the LAN/plugin wire.
-///
-/// Web listen always receives decoded 48 kHz PCM; the browser resamples.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum WireCodec {

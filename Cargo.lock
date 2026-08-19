@@ -349,6 +349,10 @@ name = "relay-jitter"
 version = "0.1.0"
 
 [[package]]
+name = "relay-libdatachannel-sys"
+version = "0.1.0"
+
+[[package]]
 name = "relay-link"
 version = "0.1.0"
 dependencies = [
@@ -423,6 +427,14 @@ version = "0.1.0"
 dependencies = [
  "prost",
  "relay-protocol",
+]
+
+[[package]]
+name = "relay-transport-libdatachannel"
+version = "0.1.0"
+dependencies = [
+ "relay-libdatachannel-sys",
+ "relay-transport",
 ]
 
 [[package]]

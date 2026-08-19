@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use relay_audio::RenderReport;
 use relay_domain::{ConnectionState, MediaRoute, SessionMode};
@@ -82,6 +82,7 @@ pub struct SessionControl {
     pcm_generation: AtomicU64,
     web_ok: AtomicBool,
     web_silent: AtomicBool,
+    web_wake: AtomicBool,
     web_wanted: AtomicBool,
     web_listeners: AtomicU32,
     lan_http_port: AtomicU32,
@@ -92,6 +93,10 @@ pub struct SessionControl {
     snapshot_peers: AtomicU32,
     snapshot_port: AtomicU32,
     snapshot_mode: AtomicU8,
+    snapshot_bound: AtomicBool,
+    snapshot_dropouts: AtomicU32,
+    last_error: Mutex<String>,
+    who: Mutex<String>,
 }
 
 impl Default for SessionControl {
@@ -111,6 +116,7 @@ impl Default for SessionControl {
             pcm_generation: AtomicU64::new(0),
             web_ok: AtomicBool::new(false),
             web_silent: AtomicBool::new(false),
+            web_wake: AtomicBool::new(false),
             web_wanted: AtomicBool::new(false),
             web_listeners: AtomicU32::new(0),
             lan_http_port: AtomicU32::new(0),
@@ -121,6 +127,10 @@ impl Default for SessionControl {
             snapshot_peers: AtomicU32::new(0),
             snapshot_port: AtomicU32::new(0),
             snapshot_mode: AtomicU8::new(0),
+            snapshot_bound: AtomicBool::new(false),
+            snapshot_dropouts: AtomicU32::new(0),
+            last_error: Mutex::new(String::new()),
+            who: Mutex::new(String::new()),
         }
     }
 }
@@ -331,6 +341,17 @@ impl SessionControl {
         self.web_silent.store(silent, Ordering::Release);
     }
 
+    /// Ask the public upload to leave silence hold and start sending again.
+    pub fn request_web_wake(&self) {
+        self.web_wake.store(true, Ordering::Release);
+    }
+
+    /// Consumes a pending wake request from the editor.
+    #[must_use]
+    pub fn take_web_wake(&self) -> bool {
+        self.web_wake.swap(false, Ordering::AcqRel)
+    }
+
     /// True when the musician opted into the public listen page.
     #[must_use]
     pub fn web_wanted(&self) -> bool {
@@ -343,6 +364,7 @@ impl SessionControl {
         if !wanted {
             self.set_web_ok(false);
             self.set_web_silent(false);
+            self.web_wake.store(false, Ordering::Release);
             self.set_web_listeners(0);
         }
     }
@@ -462,6 +484,55 @@ impl SessionControl {
                 let port = u16::try_from(self.snapshot_port.load(Ordering::Acquire)).unwrap_or(0);
                 if port == 0 { None } else { Some(port) }
             },
+            bound: self.snapshot_bound.load(Ordering::Acquire),
+            dropouts: self.snapshot_dropouts.load(Ordering::Acquire),
+        }
+    }
+
+    /// Last bind/join error, or empty when the worker is healthy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlLockError`] if the error mutex is poisoned.
+    pub fn last_error(&self) -> Result<String, ControlLockError> {
+        self.last_error
+            .lock()
+            .map(|guard| guard.clone())
+            .map_err(|_| ControlLockError)
+    }
+
+    /// Records a bind/join failure that must survive the next snapshot publish.
+    pub fn set_last_error(&self, message: impl Into<String>) {
+        if let Ok(mut guard) = self.last_error.lock() {
+            *guard = message.into();
+        }
+        self.snapshot_state
+            .store(encode_state(ConnectionState::Failed), Ordering::Release);
+    }
+
+    /// Clears a previous bind/join failure.
+    pub fn clear_last_error(&self) {
+        if let Ok(mut guard) = self.last_error.lock() {
+            guard.clear();
+        }
+    }
+
+    /// Short "who is connected" line (peer IPs plus browser counts).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlLockError`] if the who mutex is poisoned.
+    pub fn who(&self) -> Result<String, ControlLockError> {
+        self.who
+            .lock()
+            .map(|guard| guard.clone())
+            .map_err(|_| ControlLockError)
+    }
+
+    /// Replaces the "who is connected" line.
+    pub fn set_who(&self, who: impl Into<String>) {
+        if let Ok(mut guard) = self.who.lock() {
+            *guard = who.into();
         }
     }
 
@@ -478,6 +549,22 @@ impl SessionControl {
             u8::from(snapshot.mode == SessionMode::Stream),
             Ordering::Release,
         );
+        self.snapshot_bound.store(snapshot.bound, Ordering::Release);
+        self.snapshot_dropouts
+            .store(snapshot.dropouts, Ordering::Release);
+    }
+
+    fn publish_failed(&self, message: &str, snapshot: SessionSnapshot) {
+        self.set_last_error(message);
+        self.snapshot_peers
+            .store(snapshot.peers as u32, Ordering::Release);
+        self.snapshot_port.store(
+            u32::from(snapshot.local_port.unwrap_or(0)),
+            Ordering::Release,
+        );
+        self.snapshot_bound.store(snapshot.bound, Ordering::Release);
+        self.snapshot_dropouts
+            .store(snapshot.dropouts, Ordering::Release);
     }
 
     fn request_stop(&self) {
@@ -553,6 +640,12 @@ impl SessionRuntime {
         self.face.set_monitor(monitor);
     }
 
+    /// Playback ring target the host can report as latency, in device frames.
+    #[must_use]
+    pub fn playback_target_frames(&self) -> u32 {
+        self.face.playback_target_frames()
+    }
+
     /// Host-callback capture tap.
     #[must_use]
     pub fn process_capture(&mut self, interleaved: &[f32]) -> WriteOutcome {
@@ -590,34 +683,47 @@ fn spawn_worker(mut worker: SessionWorker, control: Arc<SessionControl>) -> Join
 
 fn run_worker(worker: &mut SessionWorker, control: &SessionControl) {
     let mut applied: Option<Applied> = None;
+    let mut hold_error: Option<String> = None;
     let mut last_claim = String::new();
-    let mut last_claim_at = Instant::now()
-        .checked_sub(Duration::from_secs(5))
-        .unwrap_or_else(Instant::now);
     let mut posted_web = 0_u64;
     while !control.should_stop() {
         let desired = desired_from(control);
         if applied.as_ref() != Some(&desired) {
             match apply_desired(worker, &desired) {
-                Ok(()) => applied = Some(desired),
-                Err(_) => {
-                    control
-                        .snapshot_state
-                        .store(encode_state(ConnectionState::Failed), Ordering::Release);
+                Ok(()) => {
+                    applied = Some(desired);
+                    hold_error = None;
+                    control.clear_last_error();
+                }
+                Err(error) => {
+                    hold_error = Some(error.to_string());
                 }
             }
         }
         worker.apply_codec(control.codec_settings());
         worker.apply_password(control.password_token());
-        let _ = worker.drive();
-        if let Some((pcm, seq)) = worker.take_web_pcm() {
-            if seq != posted_web {
-                control.publish_pcm(&pcm);
-                posted_web = seq;
-            }
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker.drive())).is_err() {
+            let _ = worker.apply(EngineCommand::Disconnect);
+            applied = None;
+            hold_error = Some("session worker recovered".into());
+        }
+        if let Some((pcm, seq)) = worker.take_web_pcm()
+            && seq != posted_web
+        {
+            control.publish_pcm(&pcm);
+            posted_web = seq;
         }
         let snapshot = worker.snapshot();
-        control.publish(snapshot);
+        control.set_who(who_line(
+            &worker.peer_addrs(),
+            control.lan_listeners(),
+            control.web_listeners(),
+        ));
+        if let Some(error) = hold_error.as_deref() {
+            control.publish_failed(error, snapshot);
+        } else {
+            control.publish(snapshot);
+        }
         if let Ok(name) = control.session_name() {
             let (bytes, len) = slug_bytes(&name);
             if len > 0 {
@@ -625,11 +731,9 @@ fn run_worker(worker: &mut SessionWorker, control: &SessionControl) {
             }
         }
         if let Some(key) = claim_key(control, snapshot) {
-            let due = last_claim != key || last_claim_at.elapsed() >= Duration::from_secs(2);
-            if due {
+            if last_claim != key {
                 maybe_claim_session(control, snapshot);
                 last_claim = key;
-                last_claim_at = Instant::now();
             }
         }
         thread::sleep(Duration::from_millis(2));
@@ -659,10 +763,7 @@ fn apply_desired(worker: &mut SessionWorker, desired: &Applied) -> Result<(), Pl
         return worker.apply(EngineCommand::Disconnect);
     }
     match desired.role {
-        SessionRole::ConnectListen => worker.apply(EngineCommand::Listen(SocketAddr::from((
-            [0, 0, 0, 0],
-            desired.port,
-        )))),
+        SessionRole::ConnectListen => listen_with_fallback(worker, desired.port),
         SessionRole::ConnectJoin => {
             if let Some((bytes, len)) = lan_slug(&desired.peer) {
                 worker.apply(EngineCommand::JoinLan { bytes, len })
@@ -687,8 +788,36 @@ fn apply_desired(worker: &mut SessionWorker, desired: &Applied) -> Result<(), Pl
     }
 }
 
+fn listen_with_fallback(worker: &mut SessionWorker, port: u16) -> Result<(), PlaneError> {
+    let first = SocketAddr::from(([0, 0, 0, 0], port));
+    match worker.apply(EngineCommand::Listen(first)) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if port != crate::DEFAULT_CONNECT_PORT {
+                return Err(error);
+            }
+            for extra in 1_u16..=16 {
+                let next = crate::DEFAULT_CONNECT_PORT.saturating_add(extra);
+                let addr = SocketAddr::from(([0, 0, 0, 0], next));
+                if worker.apply(EngineCommand::Listen(addr)).is_ok() {
+                    return Ok(());
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
 fn parse_peer(value: &str) -> Result<SocketAddr, PlaneError> {
     SocketAddr::from_str(value.trim()).map_err(|_| PlaneError::InvalidRole)
+}
+
+fn who_line(peers: &[SocketAddr], _lan_browsers: u32, _web: u32) -> String {
+    let mut bits = Vec::new();
+    for peer in peers {
+        bits.push(peer.ip().to_string());
+    }
+    bits.join(" · ")
 }
 
 fn slug_bytes(name: &str) -> ([u8; 48], u8) {
@@ -822,6 +951,142 @@ pub fn local_ipv4_addrs() -> Vec<String> {
     addrs
 }
 
+/// Header pill shown by the plugin editor and the listen pages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionPill {
+    /// Live is off.
+    Off,
+    /// Bind or join failed.
+    Failed,
+    /// Public upload is holding silence.
+    Asleep,
+    /// UDP listen is bound and waiting for someone.
+    Hosting,
+    /// Join is in progress.
+    Joining,
+    /// Public upload is up but nobody is listening.
+    Streaming,
+    /// At least one plugin or browser is attached.
+    Live,
+}
+
+impl SessionPill {
+    /// Stable lowercase label for the editor chrome.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Failed => "failed",
+            Self::Asleep => "asleep",
+            Self::Hosting | Self::Streaming => "ready",
+            Self::Joining => "join",
+            Self::Live => "live",
+        }
+    }
+}
+
+/// Inputs the editor and tests use to classify the session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionView {
+    /// Live toggle.
+    pub linked: bool,
+    /// Product role.
+    pub role: SessionRole,
+    /// Worker lifecycle.
+    pub state: ConnectionState,
+    /// UDP peers.
+    pub peers: usize,
+    /// Local HTTP browsers.
+    pub lan_browsers: u32,
+    /// Cloudflare `/out` browsers.
+    pub web_listeners: u32,
+    /// Public upload socket is open.
+    pub web_ok: bool,
+    /// Public upload is in DTX hold.
+    pub web_silent: bool,
+    /// Musician opted into the public page.
+    pub web_wanted: bool,
+    /// A UDP socket is bound.
+    pub bound: bool,
+}
+
+/// Maps a snapshot to the header pill.
+#[must_use]
+pub fn classify_session(view: SessionView) -> SessionPill {
+    if !view.linked {
+        return SessionPill::Off;
+    }
+    if view.state == ConnectionState::Failed {
+        return SessionPill::Failed;
+    }
+    if view.web_ok && view.web_silent {
+        return SessionPill::Asleep;
+    }
+    let audience = view.peers > 0 || view.lan_browsers > 0 || view.web_listeners > 0;
+    if audience || view.state == ConnectionState::Connected {
+        return SessionPill::Live;
+    }
+    if view.web_ok {
+        return SessionPill::Streaming;
+    }
+    let hosting = view.bound
+        && matches!(
+            view.role,
+            SessionRole::ConnectListen | SessionRole::StreamHub | SessionRole::StreamPublish
+        );
+    if hosting {
+        return SessionPill::Hosting;
+    }
+    SessionPill::Joining
+}
+
+/// One-line status under the meters.
+#[must_use]
+pub fn format_session_status(
+    view: SessionView,
+    _udp_port: Option<u16>,
+    _lan_http: u16,
+    dropouts: u32,
+    who: &str,
+    error: &str,
+) -> String {
+    if !view.linked {
+        return "Off".into();
+    }
+    if view.state == ConnectionState::Failed {
+        if error.is_empty() {
+            return "Failed".into();
+        }
+        return format!("Failed · {error}");
+    }
+    let mut bits = Vec::new();
+    match classify_session(view) {
+        SessionPill::Asleep => bits.push("Asleep".into()),
+        SessionPill::Hosting | SessionPill::Streaming => bits.push("Ready".into()),
+        SessionPill::Joining => bits.push("Joining".into()),
+        SessionPill::Live => bits.push("Live".into()),
+        SessionPill::Off | SessionPill::Failed => {}
+    }
+    let listening = view.peers + view.lan_browsers as usize + view.web_listeners as usize;
+    if listening > 0 {
+        bits.push(format!("{listening} listening"));
+    }
+    if view.web_wanted && !view.web_ok {
+        bits.push("listen page offline".into());
+    }
+    if !who.is_empty() && view.peers > 0 {
+        bits.push(who.to_owned());
+    }
+    if dropouts > 0 {
+        bits.push(format!("{dropouts} dropouts"));
+    }
+    if bits.is_empty() {
+        "Live".into()
+    } else {
+        bits.join(" · ")
+    }
+}
+
 const fn encode_state(state: ConnectionState) -> u8 {
     match state {
         ConnectionState::Idle => 0,
@@ -904,6 +1169,40 @@ mod tests {
     }
 
     #[test]
+    fn web_wake_is_consumed_once() {
+        let control = super::SessionControl::default();
+        assert!(!control.take_web_wake());
+        control.request_web_wake();
+        assert!(control.take_web_wake());
+        assert!(!control.take_web_wake());
+    }
+
+    #[test]
+    fn hosting_pill_is_bound_listen_without_audience() {
+        let view = super::SessionView {
+            linked: true,
+            role: super::SessionRole::ConnectListen,
+            state: super::ConnectionState::Connecting,
+            peers: 0,
+            lan_browsers: 0,
+            web_listeners: 0,
+            web_ok: false,
+            web_silent: false,
+            web_wanted: false,
+            bound: true,
+        };
+        assert_eq!(super::classify_session(view), super::SessionPill::Hosting);
+        assert_eq!(super::classify_session(view).as_str(), "ready");
+        assert!(
+            super::format_session_status(view, Some(17_492), 8787, 0, "", "").starts_with("Ready")
+        );
+        assert!(
+            super::format_session_status(view, Some(17_492), 8787, 3, "", "")
+                .contains("3 dropouts")
+        );
+    }
+
+    #[test]
     fn same_ipv4_24_matches_home_lan() {
         assert!(super::same_ipv4_24("192.168.1.20", "192.168.1.80"));
         assert!(!super::same_ipv4_24("192.168.1.20", "192.168.2.80"));
@@ -914,5 +1213,28 @@ mod tests {
     fn lan_listen_url_needs_port_and_name() {
         assert!(super::lan_listen_url("mix", 0).is_none());
         assert!(super::lan_listen_url("", 8787).is_none());
+    }
+
+    #[test]
+    fn claim_key_is_slug_and_bound_port() {
+        let control = super::SessionControl::default();
+        let _ = control.set_session_name("Late Night Mix");
+        control.set_linked(true);
+        control.set_role(super::SessionRole::ConnectListen);
+        let snap = crate::engine::SessionSnapshot {
+            mode: relay_domain::SessionMode::Connect,
+            state: relay_domain::ConnectionState::Connecting,
+            route: relay_domain::MediaRoute::Direct,
+            peers: 0,
+            local_port: Some(17_492),
+            bound: true,
+            dropouts: 0,
+        };
+        assert_eq!(
+            super::claim_key(&control, snap).as_deref(),
+            Some("latenightmix|127.0.0.1:17492")
+        );
+        control.set_linked(false);
+        assert_eq!(super::claim_key(&control, snap), None);
     }
 }

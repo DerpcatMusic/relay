@@ -21,13 +21,14 @@ pub use codec::{
 };
 pub use engine::{
     CallbackFace, DriveReport, EngineBuildError, EngineCommand, MonitorMode, SessionConfig,
-    SessionEngine, SessionSnapshot, SessionWorker,
+    SessionEngine, SessionSnapshot, SessionWorker, advance_scheduled,
 };
 pub use plane::{PlaneError, SocketRole};
 pub use relay_domain::{ConnectionState, MediaRoute, SessionMode};
 pub use runtime::{
-    ControlLockError, SessionControl, SessionRole, SessionRuntime, lan_listen_url,
-    local_ipv4_addrs, normalize_slug, same_ipv4_24,
+    ControlLockError, SessionControl, SessionPill, SessionRole, SessionRuntime, SessionView,
+    classify_session, format_session_status, lan_listen_url, local_ipv4_addrs, normalize_slug,
+    same_ipv4_24,
 };
 pub use wire::{WireError, WirePacket};
 

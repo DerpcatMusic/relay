@@ -1305,7 +1305,9 @@ pub struct SubmitError {
 }
 
 impl SubmitError {
-    fn new(error: TransportError, command: Command) -> Self {
+    /// Rejects `command` before it is admitted to a peer queue.
+    #[must_use]
+    pub fn new(error: TransportError, command: Command) -> Self {
         Self { error, command }
     }
 
@@ -1462,6 +1464,8 @@ pub struct PeerConfig {
     pub ice_servers: Vec<IceServer>,
     /// Features which the selected provider must implement natively.
     pub required_capabilities: RequiredCapabilities,
+    /// Offer a sendonly Opus audio track instead of a data channel.
+    pub sendonly_opus: bool,
 }
 
 impl PeerConfig {
@@ -1493,6 +1497,7 @@ impl PeerConfig {
             peer_certificate_policy: PeerCertificatePolicy::VerifySignallingFingerprint,
             ice_servers: Vec::new(),
             required_capabilities: RequiredCapabilities::default(),
+            sendonly_opus: false,
         }
     }
 

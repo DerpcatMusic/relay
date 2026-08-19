@@ -6,36 +6,44 @@ Home-network sharing uses **5 ms uncompressed stereo PCM** on LAN (no Opus, no F
 
 ## You can test now
 
-Installed:
+```bash
+cd apps/plugin
+cargo truce install
+```
 
-- CLAP: `~/.clap/RELAY.clap`
-- VST3: `~/.vst3/RELAY.vst3`
-- Standalone: `apps/plugin/target/release/relay-plugin-standalone`
-- Public listen: https://relay.matari-audio.com/`<session-name>`
+| Format | Path | Notes |
+|---|---|---|
+| CLAP | `~/.clap/RELAY.clap` | default |
+| VST3 | `~/.vst3/RELAY.vst3` | default |
+| VST2 | `~/.vst/RELAY.so` | Linux; macOS/Windows use the host VST folder |
+| LV2 | `~/.lv2/relay.lv2` | default |
+| AU v2 | `~/Library/Audio/Plug-Ins/Components/RELAY.component` | macOS |
+| AU v3 | `cargo truce install --au3` | macOS + Xcode |
+| Standalone | `target/release/relay-plugin-standalone` | `cargo truce run` |
+| AAX | `cargo truce install --aax` | needs Avid SDK; not default |
 
-Rescan plugins in the DAW.
+Public listen: https://relay.matari-audio.com/`<session-name>`
+
+Licensed [MPL-2.0](../../LICENSE). Rescan plugins in the DAW.
 
 ## Home LAN (use this)
 
 1. Both machines on the same Wi-Fi / Ethernet.
-2. Instance A: **Connect Host**, Port `17492`, set a **Session name**, **Link** on.
-3. Instance B: **Connect Join**, Peer = that **session name** (or `192.168.x.x:17492`), **Link** on.
-4. Monitor **Remote** or **Mix**. Header: `Connected`.
+2. Instance A: **Share**, leave it on. Copy the listen link or tell the other machine the session name (`big-filthy-papaya`).
+3. Instance B: **Join**, Peer = that session name (or `192.168.x.x:17492`).
+4. Monitor defaults to **Mix** (dry plus remote, so an underrun is not silence). **Hear** is the return only. **Dry** is a tap.
 
-Loopback (one instance): Product **Loopback**, **Link** on, feed the insert audio.
+Share is always a tap: DAW output is the incoming buffer, unchanged. Send only scales the stream. Hear only exists on Join. LAN and the public listen page stay on; nobody connected means no audio leaves.
 
 ## Browser listen
 
-https://relay.matari-audio.com/`<session-name>` — click **Listen**. This is a fan-out listen page (higher delay). Musicians on the same house network should use the plugin LAN path, not the browser.
+https://relay.matari-audio.com/`<session-name>` — click **Listen**. Cloudflare carries SDP/ICE only (cap 10). Audio is plugin→browser WebRTC P2P: sendonly Opus on a native audio track, played by the browser's `<audio>` element. Same-/24 browsers hop to the plugin LAN page and hear local PCM.
 
 ## Products
 
-| Product | What it does |
+| Mode | What it does |
 |---|---|
-| Connect Host | Bind UDP 17492, announce the session name on LAN |
-| Connect Join | Join `host:port` **or** a LAN session name |
-| Stream Hub / Publish / Listen | Local unpaid fan-out (also LAN PCM) |
-| Loopback | One instance self-test |
-| Web Link | Host + claim/upload to relay.matari-audio.com |
+| Share | Host a named session. DAW audio passes through. Listeners use the copied link or another RELAY on Join. |
+| Join | Attach to `host:port` or a LAN session name. Hear the remote. Mix is the default monitor. |
 
 Paid TURN / subscriptions are not implemented. Cross-NAT without a port forward will fail; same LAN does not need TURN.

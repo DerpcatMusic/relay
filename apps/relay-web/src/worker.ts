@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { forceOpusStereo } from "./opus-stereo.mjs";
 
 export interface Env {
   ROOM: DurableObjectNamespace<SessionRoom>;
@@ -21,6 +22,8 @@ type Claim = {
   at: number;
 };
 
+const MAX_LISTENERS = 10;
+
 const CORS = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET,POST,OPTIONS",
@@ -40,6 +43,7 @@ export class SessionRoom extends DurableObject {
     this.ctx.blockConcurrencyWhile(async () => {
       this.claim = (await this.ctx.storage.get<Claim>("claim")) ?? null;
       this.locked = Boolean(this.claim?.pass);
+      this.silent = this.restoreSilent();
     });
   }
 
@@ -61,9 +65,19 @@ export class SessionRoom extends DurableObject {
       const pair = new WebSocketPair();
       const server = pair[1];
       const tag = url.pathname.endsWith("/in") ? "in" : "out";
+      if (tag === "out" && this.ctx.getWebSockets("out").length >= MAX_LISTENERS) {
+        return new Response("room full", { status: 503, headers: CORS });
+      }
       this.ctx.acceptWebSocket(server, [tag]);
       if (tag === "out") {
-        server.serializeAttachment({ ok: !this.locked || (await this.isOpen()) });
+        const id = crypto.randomUUID().slice(0, 8);
+        const open = !this.locked || (await this.isOpen());
+        server.serializeAttachment({ ok: open, id });
+        if (open) {
+          this.tellHost(JSON.stringify({ t: "want", id }));
+        }
+      } else {
+        server.serializeAttachment({ silent: this.silent });
       }
       this.broadcastText(await this.roomEvent());
       return new Response(null, { status: 101, webSocket: pair[0] });
@@ -98,24 +112,56 @@ export class SessionRoom extends DurableObject {
   async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string): Promise<void> {
     const tags = this.ctx.getTags(ws);
     if (typeof message === "string") {
+      if (tags.includes("in") && this.forwardRtc("in", ws, message)) {
+        return;
+      }
       if (tags.includes("in") && (await this.handleCtrl(message))) {
         return;
       }
+      if (tags.includes("out") && this.forwardRtc("out", ws, message)) {
+        return;
+      }
       if (tags.includes("out") && (await this.checkPassword(message))) {
-        ws.serializeAttachment({ ok: true });
+        const att = (ws.deserializeAttachment() as { id?: string; ok?: boolean } | null) ?? {};
+        ws.serializeAttachment({ ...att, ok: true });
+        if (att.id) {
+          this.tellHost(JSON.stringify({ t: "want", id: att.id }));
+        }
         this.broadcastText(await this.roomEvent());
       }
       return;
     }
-    if (!tags.includes("in")) {
-      return;
-    }
-    this.silent = false;
-    this.fanout(message);
+    // Binary PCM is LAN-only. Off-LAN media is P2P WebRTC.
   }
 
   private isLive(): boolean {
-    return this.lastAt > 0 && Date.now() - this.lastAt < 800;
+    return this.hasHost() && this.listenerCounts().listeners > 0;
+  }
+
+  private hasHost(): boolean {
+    return this.ctx.getWebSockets("in").length > 0;
+  }
+
+  private restoreSilent(): boolean {
+    for (const peer of this.ctx.getWebSockets("in")) {
+      const att = peer.deserializeAttachment() as { silent?: boolean } | null;
+      if (att?.silent) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private setSilent(silent: boolean): void {
+    this.silent = silent;
+    for (const peer of this.ctx.getWebSockets("in")) {
+      const att = (peer.deserializeAttachment() as { silent?: boolean } | null) ?? {};
+      try {
+        peer.serializeAttachment({ ...att, silent });
+      } catch {
+        /* hibernation attachment optional */
+      }
+    }
   }
 
   private broadcastText(text: string): void {
@@ -142,14 +188,19 @@ export class SessionRoom extends DurableObject {
       if (this.silent) {
         return true;
       }
-      this.silent = true;
+      this.setSilent(true);
     } else if (msg.t === "go") {
       if (!this.silent) {
         return true;
       }
-      this.silent = false;
+      this.setSilent(false);
+    } else if (msg.t === "ping") {
+      return true;
     } else if (msg.t === "cfg") {
       await this.mergeClaim(msg);
+    } else if (msg.t === "stat") {
+      this.broadcastText(raw);
+      return true;
     } else {
       return false;
     }
@@ -165,6 +216,8 @@ export class SessionRoom extends DurableObject {
     rate?: number;
     deviceRate?: number;
     block?: number;
+    port?: number;
+    lanHttp?: number;
   }): Promise<void> {
     const claim = this.claim;
     if (!claim) {
@@ -173,6 +226,12 @@ export class SessionRoom extends DurableObject {
     if (msg.codec) {
       claim.codec = String(msg.codec);
       claim.mode = claim.codec;
+    }
+    if (msg.port !== undefined) {
+      claim.port = Number(msg.port) || claim.port;
+    }
+    if (msg.lanHttp !== undefined) {
+      claim.lanHttp = Number(msg.lanHttp) || claim.lanHttp;
     }
     if (msg.bitrate !== undefined) {
       claim.bitrate = Number(msg.bitrate) || claim.bitrate;
@@ -197,23 +256,78 @@ export class SessionRoom extends DurableObject {
   }
 
   async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
+    const tags = this.ctx.getTags(ws);
+    const att = ws.deserializeAttachment() as { id?: string } | null;
     try {
       ws.close(code || 1000, reason);
     } catch {
       /* already closed */
     }
+    if (tags.includes("out") && att?.id) {
+      this.tellHost(JSON.stringify({ t: "bye", id: att.id }));
+    }
     this.broadcastText(await this.roomEvent());
+  }
+
+  private tellHost(text: string): void {
+    for (const host of this.ctx.getWebSockets("in")) {
+      try {
+        host.send(text);
+      } catch {
+        /* host gone */
+      }
+    }
+  }
+
+  private forwardRtc(from: "in" | "out", ws: WebSocket, raw: string): boolean {
+    let msg: { t?: string; id?: string; sdp?: string; cand?: string };
+    try {
+      msg = JSON.parse(raw) as typeof msg;
+    } catch {
+      return false;
+    }
+    if (!msg.t || !["offer", "answer", "ice", "bye", "want"].includes(msg.t)) {
+      return false;
+    }
+    if (from === "out") {
+      const att = ws.deserializeAttachment() as { id?: string; ok?: boolean } | null;
+      if (!att?.ok || !att.id) {
+        return true;
+      }
+      msg.id = att.id;
+      this.tellHost(JSON.stringify(msg));
+      return true;
+    }
+    if (!msg.id) {
+      return true;
+    }
+    for (const peer of this.ctx.getWebSockets("out")) {
+      const att = peer.deserializeAttachment() as { id?: string } | null;
+      if (att?.id !== msg.id) {
+        continue;
+      }
+      try {
+        peer.send(raw);
+      } catch {
+        /* peer gone */
+      }
+    }
+    return true;
   }
 
   private async roomEvent(): Promise<string> {
     const counts = this.listenerCounts();
+    const host = this.hasHost();
+    const live = host && !this.silent && this.isLive();
     return JSON.stringify({
       t: "room",
       claim: await this.publicClaim(),
       listeners: counts.listeners,
       waiting: counts.waiting,
       silent: this.silent,
-      live: this.isLive(),
+      host,
+      live,
+      asleep: host && !live,
     });
   }
 
@@ -341,6 +455,10 @@ function html(body: string): Response {
     headers: {
       "content-type": "text/html; charset=utf-8",
       "cache-control": "no-store",
+      // Block Cloudflare's injected insights beacon. Firefox tracking
+      // protection fetches an empty body for it, then SRI fails.
+      "content-security-policy":
+        "default-src 'self'; script-src 'unsafe-inline' 'self' blob:; connect-src 'self' https: wss:; media-src 'self' blob: mediastream:; img-src 'self' data:; style-src 'unsafe-inline' 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com data:; worker-src 'self' blob:;",
     },
   });
 }
@@ -394,150 +512,193 @@ function playerHtml(name: string): string {
   return listenPage(name, false);
 }
 
-const WORKLET_SRC = `
-class RelayPlayer extends AudioWorkletProcessor {
-  constructor() {
-    super();
-    this.n = 96000;
-    this.l = new Float32Array(this.n);
-    this.r = new Float32Array(this.n);
-    this.wr = 0; this.rd = 0; this.filled = 0;
-    this.min = Math.round(0.02 * sampleRate);
-    this.target = Math.round(0.04 * sampleRate);
-    this.max = Math.round(0.32 * sampleRate);
-    this.primed = false;
-    this.lastL = 0; this.lastR = 0;
-    this.drops = 0;
-    this.port.onmessage = (ev) => {
-      if (ev.data && ev.data.clear) {
-        this.wr = 0; this.rd = 0; this.filled = 0; this.primed = false;
-        return;
-      }
-      if (ev.data && ev.data.target) {
-        this.target = Math.max(this.min, Math.min(this.max, ev.data.target | 0));
-        return;
-      }
-      const L = ev.data.l;
-      const R = ev.data.r;
-      for (let i = 0; i < L.length; i++) {
-        this.l[this.wr] = L[i];
-        this.r[this.wr] = R[i];
-        this.wr = (this.wr + 1) % this.n;
-        if (this.filled < this.n) this.filled++;
-        else this.rd = this.wr;
-      }
-      if (this.filled > this.max) {
-        const keep = this.target;
-        const skip = this.filled - keep;
-        this.rd = (this.rd + skip) % this.n;
-        this.filled = keep;
-      }
-      if (this.filled >= this.target) this.primed = true;
-    };
-  }
-  process(_inputs, outputs) {
-    const oL = outputs[0][0];
-    const oR = outputs[0][1] || oL;
-    const frames = oL.length;
-    if (!this.primed || this.filled < frames) {
-      for (let i = 0; i < frames; i++) {
-        this.lastL *= 0.97;
-        this.lastR *= 0.97;
-        oL[i] = this.lastL;
-        oR[i] = this.lastR;
-      }
-      if (this.primed) {
-        this.drops++;
-        this.target = Math.min(this.max, this.target + frames);
-      }
-      return true;
-    }
-    for (let i = 0; i < frames; i++) {
-      oL[i] = this.l[this.rd];
-      oR[i] = this.r[this.rd];
-      this.lastL = oL[i];
-      this.lastR = oR[i];
-      this.rd = (this.rd + 1) % this.n;
-    }
-    this.filled -= frames;
-    if (this.filled > this.target * 3 && this.target > this.min) {
-      this.target -= Math.round(0.001 * sampleRate);
-    }
-    return true;
-  }
-}
-registerProcessor('relay-player', RelayPlayer);
-`;
-
 function listenPage(name: string, landing: boolean): string {
   return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="relay-listen" content="9">
+<meta name="theme-color" content="#191919">
 <title>${landing ? "RELAY" : `RELAY · ${name}`}</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Barlow:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#191919;--lane:#252525;--surface:#353535;--text:#fff;--muted:#b8b8b8;--accent:#00aaff;--ice:#25e7ff;--ok:#5be8b3;--warn:#ffc75c;--hot:#ff7088}
-*{box-sizing:border-box}html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text);font-family:Barlow,system-ui,sans-serif}
-::selection{background:var(--accent);color:#041018}
+:root{--bg:#191919;--lane:#252525;--surface:#353535;--sunken:#101010;--text:#fff;--muted:#b8b8b8;--accent:#00aaff;--ok:#5be8b3;--warn:#ffc75c;--hot:#ff7088;--gyr0:#3d8f6a;--ink:#041018;--hair:#2e2e2e}
+*{box-sizing:border-box}html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text);font-family:Barlow,system-ui,sans-serif;color-scheme:dark}
+::selection{background:var(--accent);color:var(--ink)}
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-::-webkit-scrollbar{width:10px;height:10px}
-::-webkit-scrollbar-thumb{background:var(--surface);border-radius:8px}
-body{display:flex;justify-content:center;padding:28px 20px 48px}
-.wrap{width:min(360px,100%)}
-.nav{display:flex;align-items:center;gap:10px;height:36px;margin:0 0 28px}
+body{display:flex;justify-content:center;padding:28px 16px calc(56px + env(safe-area-inset-bottom,0px))}
+.wrap{width:min(400px,100%);padding:20px 18px 16px;background:var(--lane);border-radius:4px;box-shadow:inset 0 1px 0 #3f3f3f,0 18px 40px #00000073}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.nav{display:flex;align-items:center;gap:10px;height:32px;margin:0 0 18px}
 .mark{width:28px;height:17px;display:block;flex:none}
-.product{font-size:13px;font-weight:700;letter-spacing:.16em;color:var(--text)}
-h1{font-size:22px;line-height:1.15;letter-spacing:-.02em;margin:0 0 6px;font-weight:600}
-.who{margin:0 0 22px;color:var(--muted);font-size:13px;min-height:1.2em}
-.desk{display:flex;align-items:stretch;gap:18px;height:148px}
-.meter{flex:1;display:flex;align-items:center}
-.strip{position:relative;width:100%;height:28px;border-radius:4px;overflow:hidden;background:linear-gradient(90deg,#3d8f6a 0%,#5be8b3 42%,#ffc75c 78%,#ff7088 100%)}
-.cover{position:absolute;top:0;right:0;bottom:0;width:100%;background:var(--lane)}
-.hold{position:absolute;top:0;bottom:0;left:0;width:2px;background:#fff}
-.vol{display:flex;flex-direction:column;align-items:center;justify-content:space-between;gap:8px;width:28px;flex:none}
-.vol input{appearance:slider-vertical;writing-mode:vertical-lr;direction:rtl;width:22px;flex:1;margin:0;accent-color:var(--accent);background:transparent}
-.vol span{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;text-align:center}
-.gate{position:fixed;inset:0;display:none;place-items:center;background:#191919f2;z-index:20}
+.product{font-size:13px;font-weight:700;letter-spacing:.16em}
+.lamp{width:8px;height:8px;border-radius:50%;margin-left:auto;background:#5a5a5a;box-shadow:0 1px 2px #0008}
+.lamp[data-state="live"]{background:var(--ok);box-shadow:0 0 10px #5be8b366}
+.lamp[data-state="sleep"]{background:var(--warn)}
+.lamp[data-state="down"]{background:var(--hot)}
+.title{display:block;width:100%;margin:0;padding:2px 0 8px;font:inherit;font-size:22px;font-weight:600;letter-spacing:-.02em;line-height:1.15;color:var(--text);background:transparent;border:0;border-bottom:1px solid var(--surface);caret-color:var(--accent);outline:none;border-radius:0;cursor:text}
+.title:hover,.title:focus{border-bottom-color:var(--accent)}
+.title::placeholder{color:#9a9a9a}
+.hint{margin:0;max-height:0;opacity:0;overflow:hidden;font-size:12px;color:var(--muted);line-height:1.35}
+.title:focus + .hint{max-height:2.4em;opacity:1;margin:8px 0 0}
+.who{margin:10px 0 16px;color:var(--muted);font-size:13px;min-height:1.2em}
+.home .lamp{visibility:hidden}
+.join{display:flex;flex-direction:column;align-items:stretch}
+.open{align-self:start;min-height:44px;padding:0 18px;margin-top:8px;font:inherit;font-weight:700;border:0;border-radius:4px;background:var(--accent);color:var(--ink);cursor:pointer}
+.open:hover,.gate button:hover{filter:brightness(1.07)}
+.open:active,.gate button:active{transform:translateY(1px)}
+.stage{position:relative}
+.desk{display:flex;justify-content:center;align-items:stretch;gap:22px;height:260px;padding:16px 12px 14px;background:var(--sunken);border-radius:4px}
+.lane{display:flex;flex-direction:column;align-items:center;gap:8px;width:24px;flex:none}
+.ch{font-size:11px;font-weight:700;letter-spacing:.14em;color:var(--muted)}
+.clip{width:6px;height:6px;border-radius:1px;background:#2a2020;flex:none}
+.clip.on{background:var(--hot)}
+.rail{position:relative;flex:1;width:8px;border-radius:2px;overflow:hidden;background:linear-gradient(to top,var(--gyr0) 0%,var(--ok) 42%,var(--warn) 78%,var(--hot) 100%)}
+.cover{position:absolute;left:0;right:0;top:0;height:100%;background:var(--sunken);z-index:1}
+.peak{position:absolute;left:0;right:0;height:1px;background:#fff;bottom:0;z-index:3;pointer-events:none;opacity:0}
+.fader{display:flex;flex-direction:column;align-items:center;gap:8px;width:56px;flex:none}
+.sr-vol{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);border:0}
+.throw{position:relative;flex:1;width:48px;touch-action:none;cursor:ns-resize}
+.slot{position:absolute;left:50%;top:8px;bottom:8px;width:4px;margin-left:-2px;border-radius:2px;background:#070707}
+.cap{position:absolute;left:50%;width:28px;height:12px;margin-left:-14px;bottom:calc(100% - 12px);border-radius:2px;background:#d8d8d8;pointer-events:none}
+.fader:focus-within .cap{outline:2px solid var(--accent);outline-offset:2px}
+#voln{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;text-align:center;min-height:1.2em}
+#mute{min-height:44px;min-width:52px;padding:0 8px;font:inherit;font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;border:0;border-radius:3px;background:var(--surface);color:var(--muted);cursor:pointer}
+#mute.on{background:var(--hot);color:var(--ink)}
+.gate{position:absolute;inset:0;display:none;place-items:center;background:#191919c2;border-radius:4px;z-index:4}
 .gate.show{display:grid}
-.gate button{font:inherit;font-weight:700;font-size:16px;border:0;border-radius:8px;padding:12px 22px;background:var(--accent);color:#041018;cursor:pointer}
-.lock{display:none;margin:0 0 18px}
+.gate button{min-height:48px;min-width:148px;font:inherit;font-weight:700;font-size:16px;border:0;border-radius:4px;padding:0 22px;background:var(--accent);color:var(--ink);cursor:pointer}
+.lock{display:none;margin:0 0 16px}
 .lock.show{display:block}
 .lock label{display:block;font-size:12px;color:var(--muted);margin:0 0 6px}
-.lock input{width:100%;font:inherit;font-size:15px;border:0;border-radius:6px;padding:10px 12px;background:var(--lane);color:var(--text);caret-color:var(--accent);outline:2px solid transparent}
+.lock input{width:100%;font:inherit;font-size:16px;border:0;border-radius:4px;padding:12px;background:var(--sunken);color:var(--text);caret-color:var(--accent);outline:2px solid transparent}
 .lock input:focus{outline-color:var(--accent)}
-.lock button{margin-top:10px;font:inherit;font-weight:700;border:0;border-radius:6px;padding:8px 14px;background:var(--accent);color:#041018;cursor:pointer}
+.lock button{margin-top:10px;min-height:44px;font:inherit;font-weight:700;border:0;border-radius:4px;padding:0 16px;background:var(--accent);color:var(--ink);cursor:pointer}
 .lock .err{color:var(--hot);font-size:13px;margin-top:8px;min-height:1.2em}
+.tape{margin:14px 0 0;border-top:1px solid var(--hair);color:var(--muted)}
+.tape summary{list-style:none;cursor:pointer;display:flex;align-items:center;min-height:44px;padding:0 2px;font-size:12px;font-variant-numeric:tabular-nums;color:var(--muted)}
+.tape summary::-webkit-details-marker{display:none}
+.tape summary::after{content:'';margin-left:auto;width:7px;height:7px;border-right:1.5px solid var(--muted);border-bottom:1.5px solid var(--muted);transform:rotate(45deg);flex:none}
+.tape[open] summary::after{transform:rotate(225deg)}
+.log{margin:0 0 4px;padding:10px 12px;max-height:168px;overflow:auto;white-space:pre-wrap;font:inherit;font-size:12px;line-height:1.45;font-variant-numeric:tabular-nums;color:var(--muted);background:var(--sunken);border-radius:3px}
+.tape .log::-webkit-scrollbar{width:8px}.tape .log::-webkit-scrollbar-thumb{background:var(--surface);border-radius:4px}
+@media (max-width:420px){.wrap{padding:16px 14px 14px}.desk{height:232px;gap:16px;padding:14px 8px 12px}.throw{width:40px}.cap{width:24px;margin-left:-12px}.rail{width:6px}.lane{width:20px}}
+@media (prefers-reduced-motion:reduce){.open:active,.gate button:active{transform:none}}
 </style>
 </head>
-<body>
+<body class="${landing ? "home" : "listen"}">
+<!--
+THESIS: A Polar Night listen box. The first viewport is a channel strip, not a WebRTC demo card.
+OWN-WORLD: BUFFR Studio Blue — #191919 ground, #252525 chassis, #101010 wells, #00aaff Listen, flat GYR rails, Barlow, 2–4px corners.
+STORY: Type the session name, tap Listen, watch L/R, pull the fader. Diagnostics live in a tape you open.
+FIRST VIEWPORT: Mark + lamp; typeable session title; status; L rail | fader | R rail; Listen plate over the strip until armed.
+FORM: Pinned BUFFR / channel strip. Flat meters 2026-08-19.
+FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, DESIGN.md, and every shipping raster carrying its provenance
+-->
 <main class="wrap">
   <header class="nav">
     <svg class="mark" viewBox="0 0 2408 1488" aria-hidden="true"><path fill="#fff" d="M99.021 1486.974c-53.202.013-96.36-43.07-96.439-96.273C2.179 1122.129 1.048 366.891.645 97.561.606 71.902 10.797 47.286 28.962 29.162 47.126 11.039 71.765.904 97.424 1c69.143.26 159.026.597 212.615.799 29.175.109 56.732 13.423 74.949 36.212 86.302 107.957 344.363 430.771 467.706 585.064 17.097 21.388 42.482 34.497 69.819 36.057 27.337 1.559 54.048-8.578 73.466-27.882 155.807-154.885 504.705-501.721 606.179-602.595 18.054-17.947 42.472-28.026 67.928-28.038 44.951-.022 118.986-.057 173.583-.084 41.56-.02 78.456 26.593 91.552 66.036 75.96 228.788 328.628 989.806 429.472 1293.541 9.759 29.393 4.804 61.685-13.319 86.8-18.123 25.115-47.207 39.995-78.178 39.998-256.183.023-811.251.072-1038.748.093-16.809.001-31.963-10.123-38.396-25.652-6.433-15.529-2.878-33.404 9.007-45.29 59.457-59.456 141.243-141.242 183.755-183.754 18.081-18.081 42.604-28.24 68.174-28.24 56.829-.002 163.744-.005 250.405-.008 30.989-.001 60.088-14.896 78.21-40.034 18.121-25.138 23.056-57.454 13.262-86.855-34.745-104.305-84.02-252.224-120.519-361.795-10.545-31.654-36.704-55.606-69.162-63.328-32.459-7.721-66.602 1.887-90.27 25.402-148.441 147.483-408.034 405.401-530.914 527.487-37.693 37.45-98.58 37.346-136.145-.232-66.869-66.892-171.554-171.613-260.274-260.363-27.571-27.58-69.041-35.836-105.073-20.918-36.031 14.919-59.528 50.074-59.532 89.072-.016 128.53-.034 281.266-.046 378.02-.006 53.237-43.158 96.393-96.394 96.406-69.26.016-162.244.039-231.485.055Z"/></svg>
     <span class="product">RELAY</span>
+    <span class="lamp" id="lamp" data-state="wait" aria-hidden="true"></span>
   </header>
-  <h1 id="title">${landing ? "Listen" : name}</h1>
-  <p class="who" id="who">${landing ? "Open a session from the plugin." : "Waiting"}</p>
-  <form class="lock" id="lock" ${landing ? "hidden" : ""}>
+  ${landing ? `<form class="join" id="join">
+    <label class="sr-only" for="title">Session name</label>
+    <input id="title" class="title" placeholder="session name" autocomplete="off" spellcheck="false" enterkeyhint="go">
+    <p class="who" id="who">Name from the plugin.</p>
+    <button class="open" type="submit">Open</button>
+  </form>` : `<label class="sr-only" for="title">Session name</label>
+  <input id="title" class="title" value="${name}" spellcheck="false" autocomplete="off" enterkeyhint="go" aria-describedby="titleHint">
+  <p class="hint" id="titleHint">Type another name and press Enter to jump.</p>
+  <p class="who" id="who" role="status" aria-live="polite">Waiting for the host</p>
+  <form class="lock" id="lock">
     <label for="pw">Password</label>
     <input id="pw" type="password" autocomplete="current-password" />
     <button type="submit">Unlock</button>
     <p class="err" id="pwerr"></p>
   </form>
-  <div class="desk" ${landing ? "hidden" : ""}>
-    <div class="meter"><div class="strip" aria-label="Level"><div class="cover" id="cover"></div><div class="hold" id="hold"></div></div></div>
-    <label class="vol">
-      <input id="vol" type="range" min="0" max="2" step="0.01" value="1" orient="vertical" aria-label="Volume">
-      <span id="voln">0 dB</span>
-    </label>
+  <div class="stage">
+    <div class="desk" role="group" aria-label="Listen levels">
+      <div class="lane">
+        <span class="ch">L</span>
+        <i class="clip" id="clipL"></i>
+        <div class="rail" id="railL" role="meter" aria-label="Left" aria-valuemin="-60" aria-valuemax="0" aria-valuenow="-60" aria-valuetext="silent">
+          <div class="cover" id="coverL"></div>
+          <div class="peak" id="holdL"></div>
+        </div>
+      </div>
+      <div class="fader">
+        <input id="vol" class="sr-vol" type="range" min="0" max="1" step="0.01" value="1" orient="vertical" aria-label="Volume">
+        <div class="throw" id="throw">
+          <div class="slot" id="slot"><div class="cap" id="cap"></div></div>
+        </div>
+        <span id="voln">0.0 dB</span>
+        <button type="button" id="mute" aria-pressed="false">Mute</button>
+      </div>
+      <div class="lane">
+        <span class="ch">R</span>
+        <i class="clip" id="clipR"></i>
+        <div class="rail" id="railR" role="meter" aria-label="Right" aria-valuemin="-60" aria-valuemax="0" aria-valuenow="-60" aria-valuetext="silent">
+          <div class="cover" id="coverR"></div>
+          <div class="peak" id="holdR"></div>
+        </div>
+      </div>
+    </div>
+    <div class="gate show" id="gate" role="dialog" aria-modal="true" aria-labelledby="go"><button id="go" type="button">Listen</button></div>
   </div>
+  <details class="tape">
+    <summary id="tapeLine">Waiting for the host</summary>
+    <pre class="log" id="log" aria-hidden="true"></pre>
+  </details>`}
 </main>
-<div class="gate${landing ? "" : " show"}" id="gate"><div><button id="go" type="button">Listen</button></div></div>
-${landing ? "" : `<script>
+<audio id="spkr" playsinline webkit-playsinline autoplay aria-hidden="true"></audio>
+${landing ? `<script>
+const join = document.getElementById('join');
+const title = document.getElementById('title');
+join.onsubmit = (ev) => {
+  ev.preventDefault();
+  const slug = String(title.value || '').toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 48);
+  if (slug) location.assign('/' + slug);
+};
+title.focus();
+</script>` : `<script>
 const name = ${JSON.stringify(name)};
+const logEl = document.getElementById('log');
+const tapeLine = document.getElementById('tapeLine');
+const logLines = [];
+function log(msg) {
+  const line = new Date().toISOString().slice(11, 23) + ' ' + String(msg);
+  logLines.push(line);
+  if (logLines.length > 40) logLines.shift();
+  if (logEl) {
+    logEl.textContent = logLines.join('\\n');
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+  if (tapeLine) tapeLine.textContent = String(msg);
+  console.log('[relay]', msg);
+}
+function iceKind(cand) {
+  const t = String(cand || '');
+  if (t.indexOf(' typ srflx') >= 0) return 'srflx';
+  if (t.indexOf(' typ relay') >= 0) return 'relay';
+  if (t.indexOf(' typ prflx') >= 0) return 'prflx';
+  if (t.indexOf(' typ host') >= 0) return 'host';
+  return t ? 'ice' : 'end';
+}
+function sdpSummary(sdp) {
+  const lines = String(sdp || '').split(/\\r?\\n/);
+  const bits = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.indexOf('m=') === 0 || line.indexOf('a=rtpmap:') === 0 || line.indexOf('a=sendonly') === 0 || line.indexOf('a=recvonly') === 0 || line.indexOf('a=sendrecv') === 0 || (line.indexOf('a=fmtp:') === 0 && /stereo/i.test(line))) {
+      bits.push(line);
+    }
+  }
+  return bits.join(' ') || 'sdp';
+}
+var forceOpusStereo = ${forceOpusStereo.toString()};
 function listenTargetSec(claim) {
   const device = Number(claim && claim.deviceRate) || Number(claim && claim.rate) || 48000;
   const block = Number(claim && claim.block) || 0;
@@ -548,19 +709,28 @@ function linToDb(v) {
   return v < 1e-6 ? -60 : Math.max(-60, Math.min(0, 20 * Math.log10(v)));
 }
 function dbToPos(db) {
-  return Math.max(0, Math.min(1, (db + 48) / 48));
+  return Math.max(0, Math.min(1, (db + 60) / 60));
 }
-const cover = document.getElementById('cover');
-const holdEl = document.getElementById('hold');
+const coverL = document.getElementById('coverL');
+const coverR = document.getElementById('coverR');
+const holdLel = document.getElementById('holdL');
+const holdRel = document.getElementById('holdR');
+const railL = document.getElementById('railL');
+const railR = document.getElementById('railR');
+const clipL = document.getElementById('clipL');
+const clipR = document.getElementById('clipR');
 const who = document.getElementById('who');
+const lamp = document.getElementById('lamp');
 const vol = document.getElementById('vol');
 const voln = document.getElementById('voln');
 const gate = document.getElementById('gate');
+const titleEl = document.getElementById('title');
 let ctx = null;
 let gainNode = null;
 let lastSeq = -1;
 let rate = 48000;
-const hold = { p: 0, a: 0 };
+const holdL = { p: 0, a: 0 };
+const holdR = { p: 0, a: 0 };
 const pending = [];
 function parseFrame(buf) {
   const bytes = new Uint8Array(buf);
@@ -644,16 +814,47 @@ function decodeOpus(packet) {
     resetOpus();
   }
 }
-function setMeter(samples) {
-  let peak = 0;
-  for (let i = 0; i < samples.length; i++) peak = Math.max(peak, Math.abs(samples[i]));
+function bumpHold(hold, peak) {
   if (peak >= hold.p) { hold.p = peak; hold.a = 0; }
   else {
     hold.a += 0.04;
     if (hold.a > 0.9) hold.p *= 0.82;
   }
-  cover.style.width = ((1 - dbToPos(linToDb(peak))) * 100) + '%';
-  holdEl.style.left = (dbToPos(linToDb(hold.p)) * 100) + '%';
+  return hold.p;
+}
+function paintRail(cover, peakEl, rail, clip, hold, peak) {
+  const db = linToDb(peak);
+  const held = linToDb(bumpHold(hold, peak));
+  const pos = dbToPos(db);
+  if (cover) cover.style.height = ((1 - pos) * 100) + '%';
+  if (peakEl) {
+    peakEl.style.bottom = (dbToPos(held) * 100) + '%';
+    peakEl.style.opacity = held <= 1e-6 ? '0' : '1';
+  }
+  if (clip) clip.classList.toggle('on', peak >= 0.89);
+  if (rail) {
+    rail.setAttribute('aria-valuenow', String(Math.round(db)));
+    rail.setAttribute('aria-valuetext', db <= -59 ? 'silent' : Math.round(db) + ' dB');
+  }
+}
+function setMeterPeak(peak) {
+  pluginPeak = peak;
+  paintRail(coverL, holdLel, railL, clipL, holdL, peak);
+  paintRail(coverR, holdRel, railR, clipR, holdR, peak);
+}
+function setMeterLR(l, r) {
+  if (l < 0.002 && pluginPeak > l) l = pluginPeak;
+  if (r < 0.002 && pluginPeak > r) r = pluginPeak;
+  paintRail(coverL, holdLel, railL, clipL, holdL, l);
+  paintRail(coverR, holdRel, railR, clipR, holdR, r);
+}
+function setMeter(samples) {
+  let l = 0, r = 0;
+  for (let i = 0; i + 1 < samples.length; i += 2) {
+    l = Math.max(l, Math.abs(samples[i]));
+    r = Math.max(r, Math.abs(samples[i + 1]));
+  }
+  setMeterLR(l, r);
 }
 let node = null;
 let targetSec = 0.04;
@@ -687,10 +888,13 @@ function takeSeq(seq) {
   return true;
 }
 function fadeIn(samples) {
-  const n = Math.min(samples.length, Math.round(0.03 * rate * 2));
+  const frames = samples.length >> 1;
+  const n = Math.min(frames, Math.round(0.02 * rate));
   for (let i = 0; i < n; i++) {
     const t = i / Math.max(1, n - 1);
-    samples[i] *= 0.5 - 0.5 * Math.cos(Math.PI * t);
+    const g = 0.5 - 0.5 * Math.cos(Math.PI * t);
+    samples[i * 2] *= g;
+    samples[i * 2 + 1] *= g;
   }
 }
 function pushSamples(samples, srcRate) {
@@ -737,8 +941,41 @@ function gatherHostIps() {
   });
 }
 let lanTried = false;
+let gotPcm = false;
+let browserDrops = 0;
+let lastRoom = { host: false, live: false, silent: false, asleep: false, listeners: 0, dropouts: 0, peers: 0, claimLocked: false };
+function renderWho() {
+  let line = 'Waiting for the host';
+  let state = 'wait';
+  if (lastRoom.claimLocked && !secret) {
+    line = 'Password required';
+    state = 'down';
+  } else if (!lastRoom.host) {
+    line = 'No host on this name';
+    state = 'down';
+  } else if (lastRoom.asleep || lastRoom.silent) {
+    line = 'Host asleep';
+    state = 'sleep';
+  } else if (pc && pc.connectionState === 'connecting') {
+    line = 'Connecting';
+    state = 'wait';
+  } else if ((pc && pc.connectionState === 'connected') || lastRoom.live || gotPcm) {
+    line = 'Live';
+    state = 'live';
+  } else if (lastRoom.host) {
+    line = 'Host ready';
+    state = 'wait';
+  }
+  const extra = [];
+  if (lastRoom.listeners > 1) extra.push(lastRoom.listeners + ' listening');
+  const drops = Math.max(browserDrops, Number(lastRoom.dropouts) || 0);
+  if (drops) extra.push(drops + ' dropouts');
+  if (who) who.textContent = extra.length ? line + ' · ' + extra.join(' · ') : line;
+  if (lamp) lamp.setAttribute('data-state', state);
+}
 async function maybeLan(claim) {
   if (lanTried || !claim || !claim.lan || !claim.lan.length) return;
+  if (gotPcm) return;
   lanTried = true;
   const mine = await gatherHostIps();
   const port = Number(claim.lanHttp) || 8787;
@@ -746,6 +983,14 @@ async function maybeLan(claim) {
     const ip = claim.lan[i];
     for (let j = 0; j < mine.length; j++) {
       if (same24(ip, mine[j])) {
+        try {
+          const probe = await fetch('http://' + ip + ':' + port + '/health', { signal: AbortSignal.timeout(400) });
+          if (!probe.ok) return;
+        } catch (e) {
+          return;
+        }
+        if (gotPcm) return;
+        log('same network — local listen');
         if (socket) try { socket.close(); } catch (e) {}
         location.replace('http://' + ip + ':' + port + '/' + name);
         return;
@@ -759,7 +1004,6 @@ function flush(srcRate) {
     node.port.postMessage(resamplePlanar(pending.shift(), srcRate, ctx.sampleRate));
   }
 }
-const WORKLET = ${JSON.stringify(WORKLET_SRC)};
 function resetListen(claim) {
   lastSeq = -1;
   pending.length = 0;
@@ -775,87 +1019,487 @@ function applyClaim(claim) {
 }
 function onCtrl(raw) {
   let msg;
-  try { msg = JSON.parse(raw); } catch (e) { return; }
+  try { msg = JSON.parse(raw); } catch (e) { log('bad signal'); return; }
+  if (msg.t === 'stat') {
+    lastRoom.dropouts = Number(msg.dropouts) || lastRoom.dropouts;
+    lastRoom.peers = Number(msg.peers) || lastRoom.peers;
+    lastRoom.listeners = Number(msg.web || msg.lan || msg.listeners) || lastRoom.listeners;
+    if (typeof msg.peak === 'number') {
+      pluginPeak = msg.peak;
+      setMeterPeak(msg.peak);
+    }
+    const key = String(msg.ready) + ':' + Math.floor(Number(msg.sent) / 50) + ':' + (msg.peak > 0.002 ? 'hot' : 'quiet');
+    if (key !== lastStatLog) {
+      lastStatLog = key;
+      log('host ready=' + (msg.ready|0) + ' sent=' + (msg.sent|0) + ' peak=' + Number(msg.peak || 0).toFixed(3));
+    }
+    renderWho();
+    return;
+  }
   if (msg.t === 'room') {
-    who.textContent = msg.silent ? 'Silent' : msg.live ? 'Live' : 'Waiting';
-    if (msg.silent) dtxMode = true;
+    lastRoom = {
+      host: !!msg.host,
+      live: !!msg.live,
+      silent: !!msg.silent,
+      asleep: !!msg.asleep,
+      listeners: Number(msg.listeners) || 0,
+      dropouts: Number(msg.dropouts) || lastRoom.dropouts,
+      peers: Number(msg.peers) || lastRoom.peers,
+      claimLocked: !!(msg.claim && msg.claim.locked),
+    };
+    if (msg.asleep || msg.silent) dtxMode = true;
+    log(msg.host ? (msg.silent ? 'host silent' : 'host on') : 'no host');
+    renderWho();
     if (msg.claim) {
       maybeLan(msg.claim);
-      const key = [msg.claim.codec, msg.claim.bitrate, msg.claim.bits, msg.claim.compression, msg.claim.rate].join('|');
-      if (lastCfg && lastCfg !== key) resetListen(msg.claim);
+      const nextRate = Number(msg.claim.rate) || 48000;
+      if (lastCfg && nextRate !== rate) resetListen(msg.claim);
       else applyClaim(msg.claim);
-      lastCfg = key;
+      lastCfg = String(nextRate);
     }
     const lock = document.getElementById('lock');
     if (msg.claim && msg.claim.locked && lock && !secret) {
       lock.classList.add('show');
-      who.textContent = 'Password required';
+      log('password required');
+      renderWho();
     }
     return;
   }
   if (msg.t === 'dtx') {
     dtxMode = true;
-    who.textContent = 'Silent';
+    lastRoom.silent = true;
+    lastRoom.asleep = true;
+    log('host silent');
+    renderWho();
     return;
   }
   if (msg.t === 'go') {
-    dtxMode = false;
-    who.textContent = 'Live';
+    lastRoom.silent = false;
+    lastRoom.asleep = false;
+    lastRoom.live = true;
+    lastRoom.host = true;
+    log('host audio');
+    renderWho();
     return;
   }
   if (msg.t === 'cfg') {
-    const key = [msg.codec, msg.bitrate, msg.bits, msg.compression, msg.rate].join('|');
-    applyClaim(Object.assign({}, { name: name }, msg));
-    if (lastCfg && lastCfg !== key) resetListen(msg);
-    lastCfg = key;
+    const nextRate = Number(msg.rate) || 48000;
+    const next = Object.assign({ name: name }, msg);
+    if (lastCfg && nextRate !== rate) resetListen(next);
+    else applyClaim(next);
+    lastCfg = String(nextRate);
+    log('cfg ' + nextRate + ' Hz');
+    return;
+  }
+  if (msg.t === 'offer' && msg.sdp) {
+    log('offer ' + sdpSummary(msg.sdp));
+    if (pc && pc.remoteDescription) {
+      log('new offer — reset peer');
+      dropPc();
+    }
+    pendingOffer = msg.sdp;
+    acceptOffer(msg.sdp).catch(() => { log('offer failed'); who.textContent = 'Offer failed'; });
+    return;
+  }
+  if (msg.t === 'ice' && msg.cand) {
+    log('host ice ' + iceKind(msg.cand));
+    const cand = { candidate: msg.cand, sdpMid: msg.mid || '0', sdpMLineIndex: 0 };
+    if (pc && pc.remoteDescription) {
+      pc.addIceCandidate(cand).catch(() => { log('ice dropped'); });
+    } else {
+      pendingIce.push(cand);
+    }
+    return;
+  }
+  if (msg.t === 'bye') {
+    log('host bye');
+    dropPc();
   }
 }
-async function armAudio() {
-  if (ctx && ctx.state === 'running') return true;
-  if (!ctx) {
-    ctx = new AudioContext();
-    gainNode = ctx.createGain();
-    gainNode.connect(ctx.destination);
-    const url = URL.createObjectURL(new Blob([WORKLET], { type: 'text/javascript' }));
-    await ctx.audioWorklet.addModule(url);
-    URL.revokeObjectURL(url);
-    node = new AudioWorkletNode(ctx, 'relay-player', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2] });
-    node.port.postMessage({ target: Math.round(targetSec * ctx.sampleRate) });
-    node.connect(gainNode);
-    const applyVol = () => {
-      const v = Number(vol.value);
-      gainNode.gain.value = v;
-      voln.textContent = v <= 0 ? '−∞ dB' : (20 * Math.log10(v)).toFixed(1) + ' dB';
-    };
-    vol.oninput = applyVol;
-    applyVol();
-  }
-  if (ctx.state === 'suspended') await ctx.resume();
-  if (ctx.state !== 'running') return false;
-  gate.classList.remove('show');
-  flush(rate);
+let pc = null;
+let pendingOffer = null;
+let pendingIce = [];
+let hooked = false;
+let armed = false;
+let analyserL = null;
+let analyserR = null;
+let meterRaf = 0;
+let statsTimer = 0;
+let pluginPeak = 0;
+let lastStatLog = '';
+let offerWatch = 0;
+let wantLock = 0;
+const speaker = document.getElementById('spkr');
+function hasRemote() {
+  return !!(pc && pc.remoteDescription);
+}
+function sendWant(reason) {
+  log('want ' + reason);
+  if (!socket || socket.readyState !== 1) return false;
+  try { socket.send(JSON.stringify({ t: 'want' })); } catch (e) { return false; }
   return true;
 }
+function armOfferWatch() {
+  clearTimeout(offerWatch);
+  offerWatch = setTimeout(() => {
+    if (hasRemote() || pendingOffer) return;
+    if (sendWant('no offer')) armOfferWatch();
+  }, 4000);
+}
+function requestOffer(reason) {
+  const now = Date.now();
+  if (now - wantLock < 800) return;
+  wantLock = now;
+  dropPc();
+  sendWant(reason);
+  armOfferWatch();
+}
+const cap = document.getElementById('cap');
+const slot = document.getElementById('slot');
+const throwEl = document.getElementById('throw');
+const muteBtn = document.getElementById('mute');
+let preMute = 1;
+function placeCap(v) {
+  if (!cap || !slot) return;
+  const travel = Math.max(0, slot.clientHeight - cap.offsetHeight);
+  cap.style.bottom = (v * travel) + 'px';
+}
+function applyVol() {
+  const v = Math.max(0, Math.min(1, Number(vol.value)));
+  speaker.volume = v;
+  if (gainNode && ctx) {
+    gainNode.gain.setTargetAtTime(v, ctx.currentTime, 0.012);
+  }
+  const label = v <= 0 ? '−∞ dB' : (20 * Math.log10(v)).toFixed(1) + ' dB';
+  voln.textContent = label;
+  vol.setAttribute('aria-valuetext', label);
+  placeCap(v);
+  if (muteBtn) {
+    const on = v <= 0;
+    muteBtn.classList.toggle('on', on);
+    muteBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+  }
+}
+function snapshotRelay() {
+  window.relay = {
+    pc,
+    armed,
+    hooked,
+    gotPcm,
+    hasOffer: !!pendingOffer,
+    hasRemote: !!(pc && pc.remoteDescription),
+    conn: pc ? pc.connectionState : null,
+    ice: pc ? pc.iceConnectionState : null,
+    cover: coverL ? coverL.style.height : '',
+    coverL: coverL ? coverL.style.height : '',
+    coverR: coverR ? coverR.style.height : '',
+    ctx: ctx ? ctx.state : null,
+    logs: logLines.slice(),
+  };
+}
+function startStatsMeter() {
+  if (statsTimer) return;
+  const poll = async () => {
+    statsTimer = 0;
+    if (!pc) return;
+    startStatsMeter();
+    snapshotRelay();
+    if (analyserL) return;
+    try {
+      const stats = await pc.getStats();
+      let peak = 0;
+      stats.forEach((r) => {
+        if (typeof r.audioLevel === 'number') peak = Math.max(peak, r.audioLevel);
+      });
+      setMeterPeak(peak);
+    } catch (e) {}
+  };
+  statsTimer = setTimeout(poll, 80);
+}
+function attachStream(stream) {
+  speaker.srcObject = stream;
+  speaker.muted = !armed;
+  speaker.playsInline = true;
+  speaker.play().catch(() => {});
+  gotPcm = true;
+  lastRoom.live = true;
+  lastRoom.host = true;
+  hooked = true;
+  log('audio attached');
+  renderWho();
+  startStatsMeter();
+  snapshotRelay();
+  if (armed) wirePlayback(stream);
+}
+function tapIsUnsafe() {
+  const ua = String(navigator.userAgent || '');
+  if (/Mobile|Android|iPhone|iPad|iPod/.test(ua)) return true;
+  if (/\\b(Chrome|CriOS|Edg)\\/\\d/.test(ua) && ua.indexOf('Firefox') < 0) return true;
+  return false;
+}
+function wirePlayback(stream) {
+  speaker.srcObject = stream;
+  speaker.muted = false;
+  speaker.playsInline = true;
+  applyVol();
+  speaker.play().catch(() => {});
+  if (tapIsUnsafe()) return;
+  if (!ctx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (AC) ctx = new AC();
+  }
+  if (!ctx) return;
+  try {
+    if (!analyserL) {
+      const tap = stream.clone ? stream.clone() : stream;
+      const src = ctx.createMediaStreamSource(tap);
+      const split = ctx.createChannelSplitter(2);
+      src.connect(split);
+      analyserL = ctx.createAnalyser();
+      analyserR = ctx.createAnalyser();
+      analyserL.fftSize = 256;
+      analyserR.fftSize = 256;
+      split.connect(analyserL, 0);
+      split.connect(analyserR, 1);
+      if (!meterRaf) meterRaf = requestAnimationFrame(tickMeter);
+    }
+  } catch (e) {}
+}
+function peakOf(an) {
+  const bins = new Uint8Array(an.frequencyBinCount);
+  an.getByteTimeDomainData(bins);
+  let peak = 0;
+  for (let i = 0; i < bins.length; i++) {
+    peak = Math.max(peak, Math.abs((bins[i] - 128) / 128));
+  }
+  return peak;
+}
+function tickMeter() {
+  meterRaf = requestAnimationFrame(tickMeter);
+  if (!analyserL || !analyserR) return;
+  setMeterLR(peakOf(analyserL), peakOf(analyserR));
+}
+function ensurePc() {
+  if (pc) return pc;
+  pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }] });
+  pc.ontrack = (ev) => {
+    if (ev.track.kind !== 'audio') return;
+    ev.track.enabled = true;
+    const ch = (ev.track.getSettings && ev.track.getSettings().channelCount) || '?';
+    log('track audio' + (ev.track.muted ? ' muted' : '') + ' ch=' + ch);
+    attachStream(ev.streams[0] || new MediaStream([ev.track]));
+  };
+  pc.onicecandidate = (ev) => {
+    if (!ev.candidate || !ev.candidate.candidate || !socket || socket.readyState !== 1) {
+      if (ev && ev.candidate && !ev.candidate.candidate) log('local ice end');
+      return;
+    }
+    log('local ice ' + iceKind(ev.candidate.candidate));
+    socket.send(JSON.stringify({ t: 'ice', cand: ev.candidate.candidate, mid: ev.candidate.sdpMid }));
+  };
+  pc.oniceconnectionstatechange = () => {
+    if (!pc) return;
+    log('ice ' + pc.iceConnectionState);
+    if (pc.iceConnectionState === 'failed') requestOffer('ice failed');
+    if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+      lastRoom.live = true;
+      lastRoom.host = true;
+      renderWho();
+    }
+    if (pc.iceConnectionState === 'disconnected') {
+      const seen = pc;
+      setTimeout(() => {
+        if (pc === seen && pc.iceConnectionState === 'disconnected') requestOffer('ice stuck');
+      }, 8000);
+    }
+  };
+  pc.onconnectionstatechange = () => {
+    snapshotRelay();
+    if (!pc) return;
+    log('peer ' + pc.connectionState);
+    if (pc.connectionState === 'disconnected') {
+      const seen = pc;
+      setTimeout(() => {
+        if (pc === seen && pc.connectionState === 'disconnected') requestOffer('peer stuck');
+      }, 8000);
+      return;
+    }
+    if (pc.connectionState === 'failed') {
+      requestOffer('peer failed');
+      return;
+    }
+    if (pc.connectionState === 'connected' || pc.connectionState === 'connecting') {
+      lastRoom.live = pc.connectionState === 'connected';
+      lastRoom.host = true;
+      renderWho();
+    }
+  };
+  snapshotRelay();
+  return pc;
+}
+function dropPc() {
+  const old = pc;
+  pc = null;
+  pendingOffer = null;
+  pendingIce = [];
+  hooked = false;
+  analyserL = null;
+  analyserR = null;
+  if (meterRaf) {
+    cancelAnimationFrame(meterRaf);
+    meterRaf = 0;
+  }
+  speaker.srcObject = null;
+  if (old) try { old.close(); } catch (e) {}
+  snapshotRelay();
+}
+async function acceptOffer(sdp) {
+  clearTimeout(offerWatch);
+  const peer = ensurePc();
+  if (peer.remoteDescription) return;
+  await peer.setRemoteDescription({ type: 'offer', sdp: forceOpusStereo(sdp) });
+  pendingOffer = null;
+  const held = pendingIce.splice(0);
+  log('answer + ' + held.length + ' held ice');
+  for (let i = 0; i < held.length; i++) {
+    peer.addIceCandidate(held[i]).catch(() => {});
+  }
+  const answer = await peer.createAnswer();
+  answer.sdp = forceOpusStereo(answer.sdp);
+  await peer.setLocalDescription(answer);
+  log('answer ' + sdpSummary(answer.sdp));
+  if (socket && socket.readyState === 1) {
+    socket.send(JSON.stringify({ t: 'answer', sdp: answer.sdp }));
+  }
+  snapshotRelay();
+}
+async function armAudio() {
+  armed = true;
+  gate.classList.remove('show');
+  vol.tabIndex = 0;
+  if (muteBtn) muteBtn.tabIndex = 0;
+  speaker.muted = false;
+  applyVol();
+  speaker.play().catch(() => {});
+  if (!ctx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (AC) ctx = new AC();
+  }
+  if (ctx && ctx.state === 'suspended') {
+    ctx.resume().catch(() => {});
+  }
+  if (speaker.srcObject) wirePlayback(speaker.srcObject);
+  if (pendingOffer) {
+    try {
+      await acceptOffer(pendingOffer);
+    } catch (e) {
+      who.textContent = 'Offer failed';
+    }
+  }
+  renderWho();
+  snapshotRelay();
+}
 async function start() {
+  log('page ' + name);
   gate.classList.add('show');
-  who.textContent = 'Waiting';
+  who.textContent = 'Waiting for the host';
+  function slugifyName(raw) {
+    return String(raw || '').toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 48);
+  }
+  function goRoom(next) {
+    const slug = slugifyName(next);
+    if (!slug || slug === name) {
+      if (titleEl) titleEl.value = name;
+      return;
+    }
+    log('room ' + slug);
+    location.assign('/' + slug);
+  }
+  if (titleEl) {
+    titleEl.addEventListener('focus', () => titleEl.select());
+    titleEl.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        titleEl.blur();
+      }
+      if (ev.key === 'Escape') {
+        ev.preventDefault();
+        titleEl.value = name;
+        titleEl.blur();
+      }
+    });
+    titleEl.addEventListener('blur', () => goRoom(titleEl.value));
+  }
+  vol.tabIndex = -1;
+  if (muteBtn) muteBtn.tabIndex = -1;
+  vol.oninput = applyVol;
+  if (muteBtn) {
+    muteBtn.onclick = () => {
+      if (Number(vol.value) > 0) {
+        preMute = Number(vol.value);
+        vol.value = '0';
+      } else {
+        vol.value = String(preMute || 1);
+      }
+      applyVol();
+    };
+  }
+  if (throwEl && slot) {
+    let dragging = false;
+    const fromPointer = (ev) => {
+      const r = slot.getBoundingClientRect();
+      const t = (r.bottom - ev.clientY) / Math.max(1, r.height);
+      vol.value = String(Math.max(0, Math.min(1, t)));
+      applyVol();
+    };
+    throwEl.addEventListener('pointerdown', (ev) => {
+      if (ev.button) return;
+      dragging = true;
+      try { throwEl.setPointerCapture(ev.pointerId); } catch (e) {}
+      fromPointer(ev);
+    });
+    throwEl.addEventListener('pointermove', (ev) => { if (dragging) fromPointer(ev); });
+    throwEl.addEventListener('pointerup', () => { dragging = false; });
+    throwEl.addEventListener('pointercancel', () => { dragging = false; });
+  }
+  requestAnimationFrame(() => applyVol());
+  window.addEventListener('resize', () => placeCap(Math.max(0, Math.min(1, Number(vol.value)))));
   const lock = document.getElementById('lock');
+  const pwerr = document.getElementById('pwerr');
   if (lock) {
     lock.onsubmit = (ev) => {
       ev.preventDefault();
       const pw = document.getElementById('pw').value;
+      if (!String(pw).trim()) {
+        if (pwerr) pwerr.textContent = 'Enter the password';
+        return;
+      }
+      if (pwerr) pwerr.textContent = '';
       secret = pw;
+      log('unlock');
       if (socket && socket.readyState === 1) socket.send(pw);
     };
   }
-  const unlock = async (ev) => {
-    ev.preventDefault();
-    if (await armAudio()) {
-      window.removeEventListener('pointerdown', unlock);
+  const unlock = (ev) => {
+    if (!gate.classList.contains('show')) return;
+    if (ev && ev.target && ev.target.closest && ev.target.closest('#vol, #throw, #mute')) return;
+    gate.classList.remove('show');
+    document.getElementById('go').onclick = null;
+    armed = true;
+    speaker.muted = false;
+    applyVol();
+    speaker.play().catch(() => {});
+    if (!ctx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) ctx = new AC();
     }
+    if (ctx && ctx.resume) ctx.resume();
+    log('listen');
+    armAudio();
   };
-  window.addEventListener('pointerdown', unlock);
+  gate.addEventListener('pointerdown', unlock);
   document.getElementById('go').onclick = unlock;
+  try { document.getElementById('go').focus(); } catch (e) {}
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   let retryMs = 1000;
   const openSocket = () => {
@@ -864,18 +1508,23 @@ async function start() {
     ws.binaryType = 'arraybuffer';
     ws.onopen = () => {
       retryMs = 1000;
+      log('signal open');
       if (secret) ws.send(secret);
+      armOfferWatch();
     };
     ws.onclose = () => {
+      dropPc();
+      gotPcm = false;
+      lastRoom.live = false;
       const wait = retryMs;
-      retryMs = Math.min(retryMs * 2, 30000);
+      retryMs = Math.min(retryMs * 2, 8000);
+      log('signal closed — retry ' + wait + 'ms');
+      who.textContent = wait <= 400 ? 'Room full or reconnecting' : 'Reconnecting';
       setTimeout(openSocket, wait);
     };
+    ws.onerror = () => { log('signal error'); };
     ws.onmessage = (ev) => {
-      if (typeof ev.data === 'string') { onCtrl(ev.data); return; }
-      const resume = dtxMode;
-      dtxMode = false;
-      enqueue(ev.data, rate, resume);
+      if (typeof ev.data === 'string') onCtrl(ev.data);
     };
   };
   openSocket();

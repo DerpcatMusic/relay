@@ -38,7 +38,12 @@ pub enum PlaneError {
 
 impl core::fmt::Display for PlaneError {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(formatter, "{self:?}")
+        match self {
+            Self::Io(error) => write!(formatter, "bind or socket failed: {error}"),
+            Self::Wire(error) => write!(formatter, "wire: {error:?}"),
+            Self::InvalidRole => formatter.write_str("invalid role for this socket"),
+            Self::NotBound => formatter.write_str("no socket is bound"),
+        }
     }
 }
 
@@ -108,6 +113,12 @@ impl NativePlane {
     #[must_use]
     pub fn peer_count(&self) -> usize {
         self.peers.len()
+    }
+
+    /// Current destinations, for the editor "who" line.
+    #[must_use]
+    pub fn peer_addrs(&self) -> Vec<SocketAddr> {
+        self.peers.iter().copied().collect()
     }
 
     /// Binds a non-blocking UDP socket.

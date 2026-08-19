@@ -5,11 +5,12 @@
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use relay_session::{normalize_slug, SessionControl, DEFAULT_LINK_HTTP_PORT};
+use relay_session::{DEFAULT_LINK_HTTP_PORT, SessionControl, normalize_slug};
 use tungstenite::{Message, WebSocket};
 
 type LocalSocket = WebSocket<TcpStream>;
@@ -17,14 +18,23 @@ type LocalSocket = WebSocket<TcpStream>;
 pub struct LocalHub {
     clients: Mutex<Vec<LocalSocket>>,
     port: u16,
+    accept_stop: Arc<AtomicBool>,
+}
+
+impl Drop for LocalHub {
+    fn drop(&mut self) {
+        self.accept_stop.store(true, Ordering::Release);
+    }
 }
 
 impl LocalHub {
-    pub fn start(control: Arc<SessionControl>) -> Arc<Self> {
+    pub fn start(control: Arc<SessionControl>, stop: Arc<AtomicBool>) -> Arc<Self> {
         let (listener, port) = bind_listen();
+        let accept_stop = Arc::new(AtomicBool::new(false));
         let hub = Arc::new(Self {
             clients: Mutex::new(Vec::new()),
             port,
+            accept_stop: Arc::clone(&accept_stop),
         });
         control.set_lan_http_port(port);
         if let Some(listener) = listener {
@@ -32,7 +42,9 @@ impl LocalHub {
             let accept_control = Arc::clone(&control);
             thread::Builder::new()
                 .name("relay-lan-http".into())
-                .spawn(move || accept_loop(listener, accept_hub, accept_control))
+                .spawn(move || {
+                    accept_loop(listener, accept_hub, accept_control, stop, accept_stop);
+                })
                 .expect("lan http thread");
         }
         hub
@@ -54,6 +66,10 @@ impl LocalHub {
         self.send_all(Message::Binary(bytes.to_vec().into()));
     }
 
+    pub fn broadcast_text(&self, text: &str) {
+        self.send_all(Message::Text(text.to_owned().into()));
+    }
+
     fn send_all(&self, msg: Message) {
         let Ok(mut clients) = self.clients.lock() else {
             return;
@@ -70,7 +86,16 @@ impl LocalHub {
 }
 
 fn bind_listen() -> (Option<TcpListener>, u16) {
-    for port in DEFAULT_LINK_HTTP_PORT..=DEFAULT_LINK_HTTP_PORT + 12 {
+    let first = DEFAULT_LINK_HTTP_PORT;
+    for _ in 0..20 {
+        let addr = SocketAddr::from(([0, 0, 0, 0], first));
+        if let Ok(listener) = TcpListener::bind(addr) {
+            let _ = listener.set_nonblocking(true);
+            return (Some(listener), first);
+        }
+        thread::sleep(Duration::from_millis(15));
+    }
+    for port in first + 1..=first + 12 {
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
         if let Ok(listener) = TcpListener::bind(addr) {
             let _ = listener.set_nonblocking(true);
@@ -80,8 +105,14 @@ fn bind_listen() -> (Option<TcpListener>, u16) {
     (None, 0)
 }
 
-fn accept_loop(listener: TcpListener, hub: Arc<LocalHub>, control: Arc<SessionControl>) {
-    loop {
+fn accept_loop(
+    listener: TcpListener,
+    hub: Arc<LocalHub>,
+    control: Arc<SessionControl>,
+    stop: Arc<AtomicBool>,
+    accept_stop: Arc<AtomicBool>,
+) {
+    while !stop.load(Ordering::Acquire) && !accept_stop.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _)) => {
                 let hub = Arc::clone(&hub);
@@ -121,6 +152,20 @@ fn handle_client(stream: TcpStream, hub: &LocalHub, control: &SessionControl) {
     match (method.as_str(), path.as_str()) {
         ("GET", "/health") | ("GET", "/probe") => {
             write_http(&mut stream, 200, "text/plain; charset=utf-8", b"ok");
+        }
+        ("GET", "/status") => {
+            let name = control.session_name().unwrap_or_default();
+            let body = format!(
+                "{{\"ok\":true,\"name\":\"{}\",\"port\":{}}}",
+                normalize_slug(&name),
+                hub.port()
+            );
+            write_http(
+                &mut stream,
+                200,
+                "application/json; charset=utf-8",
+                body.as_bytes(),
+            );
         }
         ("GET", "/") => {
             let listing = control
@@ -292,10 +337,13 @@ function setMeter(samples) {{
   holdEl.style.left = (dbToPos(linToDb(hold.p)) * 100) + '%';
 }}
 function fadeIn(samples) {{
-  const n = Math.min(samples.length, 2880);
+  const frames = samples.length >> 1;
+  const n = Math.min(frames, 960);
   for (let i = 0; i < n; i++) {{
     const t = i / Math.max(1, n - 1);
-    samples[i] *= 0.5 - 0.5 * Math.cos(Math.PI * t);
+    const g = 0.5 - 0.5 * Math.cos(Math.PI * t);
+    samples[i * 2] *= g;
+    samples[i * 2 + 1] *= g;
   }}
 }}
 document.getElementById('go').onclick = async () => {{
@@ -305,23 +353,46 @@ document.getElementById('go').onclick = async () => {{
   gain.connect(ctx.destination);
   const applyVol = () => {{
     const v = Number(vol.value);
-    gain.gain.value = v;
+    const now = ctx.currentTime;
+    gain.gain.cancelScheduledValues(now);
+    gain.gain.setTargetAtTime(v, now, 0.012);
     voln.textContent = v <= 0 ? '−∞ dB' : (20 * Math.log10(v)).toFixed(1) + ' dB';
   }};
   vol.oninput = applyVol;
   applyVol();
   await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([`
     class P extends AudioWorkletProcessor {{
-      constructor() {{ super(); this.q = []; this.i = 0; this.port.onmessage = (e) => {{
-        if (e.data.clear) {{ this.q = []; this.i = 0; return; }}
-        this.q.push(e.data);
-      }}; }}
+      constructor() {{
+        super();
+        this.q = []; this.i = 0; this.lastL = 0; this.lastR = 0;
+        this.rel = Math.exp(-1 / (0.012 * sampleRate));
+        this.xfade = 0; this.xfadeN = Math.max(32, Math.round(0.008 * sampleRate));
+        this.drops = 0; this.empty = false;
+        this.port.onmessage = (e) => {{
+          if (e.data.clear) {{ this.q = []; this.i = 0; this.xfade = 0; return; }}
+          const empty = !this.q.length;
+          this.q.push(e.data);
+          if (empty) this.xfade = this.xfadeN;
+        }};
+      }}
       process(_, outputs) {{
         const L = outputs[0][0], R = outputs[0][1] || outputs[0][0];
         for (let i = 0; i < L.length; i++) {{
           while (this.q.length && this.i >= this.q[0].l.length) {{ this.q.shift(); this.i = 0; }}
-          if (!this.q.length) {{ L[i] = 0; R[i] = 0; continue; }}
-          L[i] = this.q[0].l[this.i]; R[i] = this.q[0].r[this.i]; this.i++;
+          if (!this.q.length) {{
+            if (!this.empty) {{ this.empty = true; this.drops++; this.port.postMessage({{drops: this.drops}}); }}
+            this.lastL *= this.rel; this.lastR *= this.rel;
+            L[i] = this.lastL; R[i] = this.lastR; continue;
+          }}
+          this.empty = false;
+          let sL = this.q[0].l[this.i], sR = this.q[0].r[this.i];
+          if (this.xfade > 0) {{
+            const g = 1 - this.xfade / this.xfadeN;
+            sL = this.lastL * (1 - g) + sL * g;
+            sR = this.lastR * (1 - g) + sR * g;
+            this.xfade--;
+          }}
+          L[i] = sL; R[i] = sR; this.lastL = sL; this.lastR = sR; this.i++;
         }}
         return true;
       }}
@@ -329,51 +400,85 @@ document.getElementById('go').onclick = async () => {{
     registerProcessor('p', P);
   `], {{type:'text/javascript'}})));
   const node = new AudioWorkletNode(ctx, 'p', {{numberOfInputs:0, numberOfOutputs:1, outputChannelCount:[2]}});
+  let drops = 0;
+  let room = {{ host: true, live: false, listeners: 0, dropouts: 0 }};
+  const show = () => {{
+    const bits = [];
+    if (room.live) bits.push('Live');
+    else if (room.host) bits.push('Ready');
+    else bits.push('Waiting');
+    if (room.listeners) bits.push(room.listeners + ' listening');
+    const n = Math.max(drops, Number(room.dropouts) || 0);
+    if (n) bits.push(n + ' dropouts');
+    who.textContent = bits.join(' · ');
+  }};
+  node.port.onmessage = (e) => {{ if (e.data && e.data.drops !== undefined) {{ drops = e.data.drops; show(); }} }};
   node.connect(gain);
   document.getElementById('gate').style.display = 'none';
   who.textContent = 'Waiting';
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(proto + '://' + location.host + '/' + name + '/out');
-  ws.binaryType = 'arraybuffer';
   let last = -1;
   let resume = false;
-  ws.onopen = () => {{ who.textContent = 'Live'; }};
-  ws.onclose = () => {{ who.textContent = 'Waiting'; }};
-  ws.onmessage = (ev) => {{
-    if (typeof ev.data === 'string') {{
-      try {{
-        const m = JSON.parse(ev.data);
-        if (m.t === 'dtx') {{ resume = true; who.textContent = 'Silent'; }}
-        if (m.t === 'go') {{ who.textContent = 'Live'; }}
-      }} catch (e) {{}}
-      return;
-    }}
-    const bytes = new Uint8Array(ev.data);
-    if (bytes.byteLength < 8) return;
-    const seq = new DataView(bytes.buffer, bytes.byteOffset, 8).getUint32(4, true);
-    if (last >= 0 && seq <= last && last - seq < 32) return;
-    last = seq;
-    const n = (bytes.byteLength - 8) >> 1;
-    const pcm = new Float32Array(n);
-    const view = new DataView(bytes.buffer, bytes.byteOffset + 8);
-    for (let i = 0; i < n; i++) pcm[i] = view.getInt16(i * 2, true) / 32767;
-    if (resume) {{ fadeIn(pcm); resume = false; }}
-    who.textContent = 'Live';
-    setMeter(pcm);
-    const frames = n >> 1;
-    const l = new Float32Array(frames), r = new Float32Array(frames);
-    for (let i = 0; i < frames; i++) {{ l[i] = pcm[i*2]; r[i] = pcm[i*2+1]; }}
-    const src = 48000, dst = ctx.sampleRate;
-    if (src === dst) {{ node.port.postMessage({{l, r}}); return; }}
-    const outN = Math.max(1, Math.round(frames * dst / src));
-    const ol = new Float32Array(outN), or = new Float32Array(outN);
-    for (let i = 0; i < outN; i++) {{
-      const p = i * src / dst, j = Math.min(frames - 1, p | 0), f = p - j, j2 = Math.min(frames - 1, j + 1);
-      ol[i] = l[j] * (1 - f) + l[j2] * f;
-      or[i] = r[j] * (1 - f) + r[j2] * f;
-    }}
-    node.port.postMessage({{l: ol, r: or}});
+  let retryMs = 400;
+  const openOut = () => {{
+    const ws = new WebSocket(proto + '://' + location.host + '/' + name + '/out');
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = () => {{ retryMs = 400; room.host = true; show(); }};
+    ws.onclose = () => {{
+      resume = true;
+      last = -1;
+      room.live = false;
+      room.host = false;
+      who.textContent = 'Reconnecting';
+      const wait = retryMs;
+      retryMs = Math.min(retryMs * 2, 8000);
+      setTimeout(openOut, wait);
+    }};
+    ws.onmessage = (ev) => {{
+      if (typeof ev.data === 'string') {{
+        try {{
+          const m = JSON.parse(ev.data);
+          if (m.t === 'dtx') {{ resume = true; room.live = false; who.textContent = 'Asleep'; }}
+          if (m.t === 'go') {{ room.live = true; show(); }}
+          if (m.t === 'room' || m.t === 'stat') {{
+            room.host = m.host !== false;
+            room.live = !!m.live;
+            room.listeners = Number(m.listeners || m.lan || 0);
+            room.dropouts = Number(m.dropouts) || room.dropouts;
+            show();
+          }}
+        }} catch (e) {{}}
+        return;
+      }}
+      room.live = true;
+      const bytes = new Uint8Array(ev.data);
+      if (bytes.byteLength < 8) return;
+      const seq = new DataView(bytes.buffer, bytes.byteOffset, 8).getUint32(4, true);
+      if (last >= 0 && seq <= last && last - seq < 32) return;
+      last = seq;
+      const n = (bytes.byteLength - 8) >> 1;
+      const pcm = new Float32Array(n);
+      const view = new DataView(bytes.buffer, bytes.byteOffset + 8);
+      for (let i = 0; i < n; i++) pcm[i] = view.getInt16(i * 2, true) / 32767;
+      if (resume) {{ fadeIn(pcm); resume = false; }}
+      who.textContent = 'Live';
+      setMeter(pcm);
+      const frames = n >> 1;
+      const l = new Float32Array(frames), r = new Float32Array(frames);
+      for (let i = 0; i < frames; i++) {{ l[i] = pcm[i*2]; r[i] = pcm[i*2+1]; }}
+      const src = 48000, dst = ctx.sampleRate;
+      if (src === dst) {{ node.port.postMessage({{l, r}}); return; }}
+      const outN = Math.max(1, Math.round(frames * dst / src));
+      const ol = new Float32Array(outN), or = new Float32Array(outN);
+      for (let i = 0; i < outN; i++) {{
+        const p = i * src / dst, j = Math.min(frames - 1, p | 0), f = p - j, j2 = Math.min(frames - 1, j + 1);
+        ol[i] = l[j] * (1 - f) + l[j2] * f;
+        or[i] = r[j] * (1 - f) + r[j2] * f;
+      }}
+      node.port.postMessage({{l: ol, r: or}});
+    }};
   }};
+  openOut();
 }};
 </script></body></html>"#
     )

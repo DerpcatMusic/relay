@@ -1,24 +1,29 @@
-//! RELAY editor: BUFFR Studio Blue chrome, Plugcat knobs, labeled fields.
+//! RELAY editor: Polar Night chrome, Share/Join, full-height L/R meters.
 
 use std::time::{Duration, Instant};
 
-use plugcat::{
-    tactile_knob_with_tokens, WidgetColors, WidgetRadius, WidgetSpacing, WidgetStroke, WidgetTokens,
-};
 use relay_session::{
-    lan_listen_url, normalize_slug, ConnectionState, DEFAULT_CONNECT_PORT, PUBLIC_LINK_ORIGIN,
+    DEFAULT_CONNECT_PORT, PUBLIC_LINK_ORIGIN, SessionPill, SessionView, classify_session,
+    format_session_status, normalize_slug,
 };
 use truce_core::editor::{PluginContext, PluginContextReadF32};
 use truce_egui::EditorUi;
 
 use crate::{
-    new_slug, publish_control, Codec, Product, RelayParams, RelayParamsParamId as P, MAX_WINDOW_H,
-    MAX_WINDOW_W, METER_FLOOR_DB, MIN_WINDOW_H, MIN_WINDOW_W, WINDOW_W,
+    Codec, MAX_WINDOW_H, MAX_WINDOW_W, METER_FLOOR_DB, MIN_WINDOW_H, MIN_WINDOW_W, Monitor,
+    Product, RelayParams, RelayParamsParamId as P, WINDOW_W, new_slug, publish_control,
 };
 
 const MATARI_URL: &str = "https://matari-audio.com";
 const RELAY_URL: &str = "https://matari-audio.com";
 const GAIN_DEFAULT_01: f32 = 24.0 / 36.0;
+const METER_COL: f32 = 28.0;
+
+const ICON_DICE: &[u8] = include_bytes!("../assets/icons/dice-five.svg");
+const ICON_COPY: &[u8] = include_bytes!("../assets/icons/copy.svg");
+const ICON_OPEN: &[u8] = include_bytes!("../assets/icons/arrow-square-out.svg");
+const ICON_LOCK: &[u8] = include_bytes!("../assets/icons/lock-simple.svg");
+const ICON_CHECK: &[u8] = include_bytes!("../assets/icons/check.svg");
 
 /// BUFFR Studio Blue — same tokens as drop-recorder `themes.json`.
 const BG: egui::Color32 = egui::Color32::from_rgb(25, 25, 25);
@@ -32,58 +37,16 @@ const WARN: egui::Color32 = egui::Color32::from_rgb(255, 199, 92);
 const HOT: egui::Color32 = egui::Color32::from_rgb(255, 112, 136);
 const SUNKEN: egui::Color32 = egui::Color32::from_rgb(16, 16, 16);
 const BORDER: egui::Color32 = egui::Color32::from_rgb(26, 94, 128);
+const GYR_FLOOR: egui::Color32 = egui::Color32::from_rgb(61, 143, 106);
 
-const STUDIO_TOKENS: WidgetTokens = WidgetTokens {
-    name: "Studio Blue",
-    light_visuals: false,
-    colors: WidgetColors {
-        background: BG,
-        surface: SURFACE,
-        surface_low: LANE,
-        surface_high: SURFACE,
-        surface_dark: SUNKEN,
-        border: BORDER,
-        text: TEXT,
-        text_on_dark: TEXT,
-        muted: MUTED,
-        muted_on_dark: MUTED,
-        accent: PRIMARY,
-        accent_hover: egui::Color32::from_rgb(37, 231, 255),
-        selected: SURFACE,
-        track: LANE,
-        success: OK,
-        warning: WARN,
-        error: HOT,
-        disabled: LANE,
-        disabled_text: MUTED,
-        shadow: egui::Color32::from_black_alpha(64),
-        transparent: egui::Color32::TRANSPARENT,
-        white: egui::Color32::WHITE,
-        knob_cap: egui::Color32::from_rgb(37, 43, 48),
-        knob_cap_highlight: egui::Color32::from_rgb(48, 54, 59),
-        knob_arc_track: LANE,
-        knob_arc_value: TEXT,
-        knob_marker: TEXT,
-    },
-    radius: WidgetRadius {
-        panel: 6,
-        control: 6,
-        tile: 6,
-    },
-    spacing: WidgetSpacing {
-        xs: 4.0,
-        sm: 8.0,
-        md: 8.0,
-        lg: 12.0,
-    },
-    stroke: WidgetStroke { control: 1.0 },
-};
+const FX_KNOB_DIAMETER: f32 = 62.0;
+const FX_ARC_START: f32 = std::f32::consts::PI * 0.75;
+const FX_ARC_SWEEP: f32 = std::f32::consts::PI * 1.5;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Overlay {
     None,
     About,
-    Settings,
 }
 
 pub struct RelayUi {
@@ -91,8 +54,10 @@ pub struct RelayUi {
     pub name_buf: String,
     pub pass_buf: String,
     copied: Option<(String, Instant)>,
-    hold: f32,
-    hold_age: f32,
+    hold_l: f32,
+    hold_r: f32,
+    hold_age_l: f32,
+    hold_age_r: f32,
     last_h: u32,
     overlay: Overlay,
 }
@@ -104,8 +69,10 @@ impl RelayUi {
             name_buf: String::new(),
             pass_buf: String::new(),
             copied: None,
-            hold: 0.0,
-            hold_age: 0.0,
+            hold_l: 0.0,
+            hold_r: 0.0,
+            hold_age_l: 0.0,
+            hold_age_r: 0.0,
             last_h: window_h,
             overlay: Overlay::None,
         }
@@ -131,6 +98,7 @@ impl EditorUi<RelayParams> for RelayUi {
         if ctx.params().product.value().is_link() {
             ctx.params().link.set_value(true);
         }
+        ctx.params().web.set_value(true);
         let _ = ctx.params().control.set_peer(self.peer_buf.clone());
         let _ = ctx.params().control.set_session_name(self.name_buf.clone());
         let _ = ctx.params().control.set_password(self.pass_buf.clone());
@@ -142,16 +110,14 @@ impl EditorUi<RelayParams> for RelayUi {
         let snap = ctx.params().control.snapshot();
         let linked = ctx.params().link.value();
         let product = ctx.params().product.value();
-        let web_on = ctx.params().web.value();
         let web_ok = ctx.params().control.web_ok();
         let web_silent = ctx.params().control.web_silent();
-        let listeners = ctx.params().control.web_listeners();
         egui::Panel::top("header")
             .exact_size(40.0)
             .frame(egui::Frame::NONE.fill(BG))
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
-                    ui.add_space(12.0);
+                    ui.add_space(10.0);
                     if relay_logo(ui).clicked() {
                         self.overlay = if self.overlay == Overlay::About {
                             Overlay::None
@@ -159,21 +125,44 @@ impl EditorUi<RelayParams> for RelayUi {
                             Overlay::About
                         };
                     }
-                    ui.add_space(12.0);
+                    ui.add_space(10.0);
                     mode_nav(ui, ctx, product);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_space(12.0);
-                        if chip(ui, "Settings").clicked() {
-                            self.overlay = if self.overlay == Overlay::Settings {
-                                Overlay::None
-                            } else {
-                                Overlay::Settings
-                            };
-                        }
-                        ui.add_space(6.0);
+                        ui.add_space(10.0);
                         live_pill(ui, ctx, linked, snap, web_ok, web_silent);
                     });
                 });
+            });
+
+        let peak_l = ctx.get_meter(P::MeterLeft);
+        let peak_r = ctx.get_meter(P::MeterRight);
+        update_hold(&mut self.hold_l, &mut self.hold_age_l, peak_l);
+        update_hold(&mut self.hold_r, &mut self.hold_age_r, peak_r);
+
+        egui::Panel::left("meter-l")
+            .exact_size(METER_COL)
+            .resizable(false)
+            .show_separator_line(false)
+            .frame(
+                egui::Frame::NONE
+                    .fill(BG)
+                    .inner_margin(egui::Margin::symmetric(7, 10)),
+            )
+            .show(ui, |ui| {
+                meter_column(ui, peak_l, self.hold_l, "L");
+            });
+
+        egui::Panel::right("meter-r")
+            .exact_size(METER_COL)
+            .resizable(false)
+            .show_separator_line(false)
+            .frame(
+                egui::Frame::NONE
+                    .fill(BG)
+                    .inner_margin(egui::Margin::symmetric(7, 10)),
+            )
+            .show(ui, |ui| {
+                meter_column(ui, peak_r, self.hold_r, "R");
             });
 
         let mut content_bottom = 0.0;
@@ -181,58 +170,61 @@ impl EditorUi<RelayParams> for RelayUi {
             .frame(
                 egui::Frame::central_panel(ui.style())
                     .fill(BG)
-                    .inner_margin(egui::Margin::symmetric(14, 12)),
+                    .inner_margin(egui::Margin::symmetric(12, 10)),
             )
             .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 10.0;
-                ui.label(
-                    egui::RichText::new(if product.is_link() {
-                        self.name_buf.as_str()
-                    } else {
-                        "Connect"
-                    })
-                    .size(20.0)
-                    .color(TEXT)
-                    .strong(),
-                );
+                ui.spacing_mut().item_spacing.y = 8.0;
                 if product.is_link() {
                     session_row(ui, self, ctx);
                 } else {
-                    labeled_field(ui, "Peer", &mut self.peer_buf, false, |value| {
-                        if let Ok(mut session) = ctx.params().session.write() {
-                            session.peer = value.to_owned();
-                        }
-                        let _ = ctx.params().control.set_peer(value.to_owned());
-                        if !value.trim().is_empty() {
-                            ctx.params().link.set_value(true);
-                            publish_control(ctx.params());
-                        }
-                    });
+                    labeled_field(
+                        ui,
+                        "Peer",
+                        &mut self.peer_buf,
+                        false,
+                        "host:port or session name",
+                        |value| {
+                            if let Ok(mut session) = ctx.params().session.write() {
+                                session.peer = value.to_owned();
+                            }
+                            let _ = ctx.params().control.set_peer(value.to_owned());
+                            if !value.trim().is_empty() {
+                                ctx.params().link.set_value(true);
+                                publish_control(ctx.params());
+                            }
+                        },
+                    );
                 }
-                labeled_field(ui, "Password", &mut self.pass_buf, true, |value| {
-                    commit_password(ctx, value);
-                });
+                password_row(ui, self, ctx);
                 codec_row(ui, ctx);
+                if !product.is_link() {
+                    let current = ctx.params().monitor.value();
+                    if let Some(next) = buffr_segmented(
+                        ui,
+                        "relay-monitor",
+                        &[
+                            (Monitor::Dry, "Dry"),
+                            (Monitor::Mix, "Mix"),
+                            (Monitor::Remote, "Hear"),
+                        ],
+                        current,
+                    ) {
+                        ctx.params().monitor.set_value(next);
+                    }
+                }
 
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 16.0;
                     gain_knob(ui, ctx, P::InputGain, "Send");
-                    gain_knob(ui, ctx, P::OutputGain, "Hear");
+                    if !product.is_link() {
+                        gain_knob(ui, ctx, P::OutputGain, "Hear");
+                    }
                 });
-                self.level_strip(ui, ctx);
 
                 ui.label(
-                    egui::RichText::new(status_line(
-                        linked,
-                        web_on,
-                        web_ok,
-                        web_silent,
-                        listeners,
-                        snap.peers,
-                        ctx.params().control.lan_listeners(),
-                    ))
-                    .size(12.0)
-                    .color(MUTED),
+                    egui::RichText::new(editor_status(ctx, linked, snap, web_ok, web_silent))
+                        .size(12.0)
+                        .color(MUTED),
                 );
                 content_bottom = ui.cursor().min.y;
             });
@@ -240,7 +232,6 @@ impl EditorUi<RelayParams> for RelayUi {
         match self.overlay {
             Overlay::None => {}
             Overlay::About => about_window(ui, &mut self.overlay),
-            Overlay::Settings => settings_window(ui, ctx, self),
         }
 
         let needed = (content_bottom + 16.0)
@@ -296,7 +287,7 @@ pub fn buffr_visuals() -> egui::Visuals {
         color: egui::Color32::from_black_alpha(56),
     };
     visuals.window_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 48, 48));
-    let radius = egui::CornerRadius::same(6);
+    let radius = egui::CornerRadius::same(4);
     visuals.menu_corner_radius = radius;
     visuals.window_corner_radius = radius;
     for widget in [
@@ -314,7 +305,7 @@ pub fn buffr_visuals() -> egui::Visuals {
 fn apply_buffr_spacing(ui: &mut egui::Ui) {
     let spacing = &mut ui.style_mut().spacing;
     spacing.item_spacing = egui::vec2(8.0, 6.0);
-    spacing.button_padding = egui::vec2(11.0, 5.0);
+    spacing.button_padding = egui::vec2(8.0, 5.0);
     spacing.combo_width = 160.0;
     spacing.interact_size.y = 26.0;
 }
@@ -334,11 +325,11 @@ fn relay_logo(ui: &mut egui::Ui) -> egui::Response {
     .response
     .interact(egui::Sense::click())
     .on_hover_cursor(egui::CursorIcon::PointingHand)
-    .on_hover_text("About RELAY · Matari Audio")
+    .on_hover_text("About RELAY")
 }
 
 fn mode_nav(ui: &mut egui::Ui, ctx: &PluginContext<RelayParams>, product: Product) {
-    let options = [(false, "CONNECT"), (true, "LINK")];
+    let options = [(true, "Share"), (false, "Join")];
     let current = product.is_link();
     if let Some(link) = buffr_segmented(ui, "relay-mode", &options, current) {
         let next = if link {
@@ -361,10 +352,10 @@ fn buffr_segmented<T: Copy + PartialEq>(
     current: T,
 ) -> Option<T> {
     let font = egui::FontId::proportional(12.0);
-    let pad = 14.0;
+    let pad = 12.0;
     let inset = 2.0;
     let height = 26.0;
-    let radius = 8.0;
+    let radius = 4.0;
     let seg_w = options
         .iter()
         .map(|(_, label)| {
@@ -375,7 +366,7 @@ fn buffr_segmented<T: Copy + PartialEq>(
                     .x
             }) + pad * 2.0
         })
-        .fold(64.0_f32, f32::max);
+        .fold(56.0_f32, f32::max);
     let total_w = seg_w * options.len() as f32 + inset * 2.0;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(total_w, height), egui::Sense::hover());
     ui.painter().rect_filled(rect, radius, SUNKEN);
@@ -399,7 +390,7 @@ fn buffr_segmented<T: Copy + PartialEq>(
             egui::pos2(rect.left() + inset + eased * seg_w, rect.top() + inset),
             egui::vec2(seg_w, height - inset * 2.0),
         ),
-        6.0,
+        3.0,
         PRIMARY,
     );
     let mut chosen = None;
@@ -412,7 +403,7 @@ fn buffr_segmented<T: Copy + PartialEq>(
         let response = ui.interact(seg, ui.id().with((id, index)), egui::Sense::click());
         let selected = *value == current;
         if !selected && response.hovered() {
-            ui.painter().rect_filled(seg, 6.0, SURFACE);
+            ui.painter().rect_filled(seg, 3.0, SURFACE);
         }
         ui.painter().text(
             seg.center(),
@@ -430,32 +421,144 @@ fn buffr_segmented<T: Copy + PartialEq>(
 }
 
 fn gain_knob(ui: &mut egui::Ui, ctx: &PluginContext<RelayParams>, id: P, label: &str) {
-    ui.vertical(|ui| {
-        ui.set_width(72.0);
-        let mut value = ctx.get_param(id);
-        let response = tactile_knob_with_tokens(ui, &mut value, 46.0, true, &STUDIO_TOKENS);
-        if response.double_clicked() {
-            ctx.automate(id, f64::from(GAIN_DEFAULT_01));
-        } else {
-            if response.drag_started() {
-                ctx.begin_edit(id);
-            }
-            if response.changed() {
-                ctx.set_param(id, f64::from(value));
-            }
-            if response.drag_stopped() {
-                ctx.end_edit(id);
-            }
+    let diameter = FX_KNOB_DIAMETER;
+    let width = (diameter * (4.7 / 4.15)).max(diameter);
+    let (_, rect) = ui.allocate_space(egui::vec2(width, diameter));
+    let response = ui.interact(
+        rect,
+        ui.id().with(("fx-knob", label)),
+        egui::Sense::click_and_drag(),
+    );
+    let mut value = ctx.get_param(id);
+    let reset = response.double_clicked();
+    if reset {
+        ctx.automate(id, f64::from(GAIN_DEFAULT_01));
+        value = GAIN_DEFAULT_01;
+    } else if response.dragged() {
+        let drag_id = response.id.with("normalized-drag-value");
+        if response.drag_started() {
+            ctx.begin_edit(id);
+            ui.ctx().data_mut(|data| data.insert_temp(drag_id, value));
         }
-        ui.label(
-            egui::RichText::new(ctx.format_param(id))
-                .size(11.0)
-                .color(TEXT),
+        let mut drag = ui
+            .ctx()
+            .data(|data| data.get_temp::<f32>(drag_id))
+            .unwrap_or(value);
+        let fine = ui.input(|input| input.modifiers.shift);
+        let sensitivity = if fine { 0.0007 } else { 0.005 };
+        drag = (drag - ui.input(|input| input.pointer.delta().y) * sensitivity).clamp(0.0, 1.0);
+        ui.ctx().data_mut(|data| data.insert_temp(drag_id, drag));
+        value = drag;
+        ctx.set_param(id, f64::from(value));
+    }
+    if response.drag_stopped() {
+        ui.ctx()
+            .data_mut(|data| data.remove::<f32>(response.id.with("normalized-drag-value")));
+        ctx.end_edit(id);
+    }
+
+    let interactive = response.hovered() || response.dragged() || response.has_focus();
+    let interactive_t =
+        ui.ctx()
+            .animate_bool_with_time(response.id.with("outer-arc"), interactive, 0.18);
+    let center = rect.center();
+    let radius = diameter * 0.43;
+    let value_angle = FX_ARC_START + value * FX_ARC_SWEEP;
+    let fill_start = FX_ARC_START + GAIN_DEFAULT_01 * FX_ARC_SWEEP;
+    let track = mix(SUNKEN, TEXT, 0.24);
+    let rim = mix(SUNKEN, TEXT, 0.18);
+    ui.painter().circle_filled(
+        center + egui::vec2(0.0, 2.0),
+        radius + 1.0,
+        egui::Color32::from_black_alpha(if interactive { 92 } else { 68 }),
+    );
+    ui.painter().circle_filled(center, radius, rim);
+    ui.painter().circle_filled(center, radius - 2.0, SUNKEN);
+    let arc_radius = radius + 3.5;
+    paint_arc(
+        ui.painter(),
+        center,
+        arc_radius,
+        FX_ARC_START,
+        FX_ARC_START + FX_ARC_SWEEP,
+        egui::Stroke::new(1.2 + interactive_t * 0.3, track),
+    );
+    if (value_angle - fill_start).abs() > 0.001 {
+        let value_width = 1.35 + interactive_t * 1.35;
+        paint_arc(
+            ui.painter(),
+            center,
+            arc_radius + (value_width - 1.35) * 0.5,
+            fill_start,
+            value_angle,
+            egui::Stroke::new(value_width, PRIMARY),
         );
-        ui.label(egui::RichText::new(label).size(11.0).color(MUTED));
-    })
-    .response
-    .on_hover_text("Double-click to reset");
+    }
+    let direction = egui::emath::Rot2::from_angle(value_angle) * egui::vec2(1.0, 0.0);
+    ui.painter().line_segment(
+        [
+            center + direction * radius * 0.62,
+            center + direction * radius * 0.86,
+        ],
+        egui::Stroke::new((radius * 0.075).clamp(1.75, 2.75), TEXT),
+    );
+    ui.painter().text(
+        egui::pos2(center.x, center.y - 4.8),
+        egui::Align2::CENTER_CENTER,
+        ctx.format_param(id),
+        egui::FontId::monospace(11.0),
+        TEXT,
+    );
+    ui.painter().text(
+        egui::pos2(center.x, center.y + 8.8),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(9.5),
+        MUTED,
+    );
+    if response.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+    }
+    response
+        .on_hover_text("Double-click to reset")
+        .on_hover_cursor(egui::CursorIcon::ResizeVertical);
+}
+
+fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let inv = 1.0 - t;
+    egui::Color32::from_rgba_unmultiplied(
+        (f32::from(a.r()) * inv + f32::from(b.r()) * t).round() as u8,
+        (f32::from(a.g()) * inv + f32::from(b.g()) * t).round() as u8,
+        (f32::from(a.b()) * inv + f32::from(b.b()) * t).round() as u8,
+        (f32::from(a.a()) * inv + f32::from(b.a()) * t).round() as u8,
+    )
+}
+
+fn paint_arc(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    radius: f32,
+    start: f32,
+    end: f32,
+    stroke: egui::Stroke,
+) {
+    let steps = (((end - start).abs() / std::f32::consts::PI) * 32.0)
+        .ceil()
+        .max(4.0) as usize;
+    for step in 0..steps {
+        let t0 = step as f32 / steps as f32;
+        let t1 = (step + 1) as f32 / steps as f32;
+        let a0 = start + (end - start) * t0;
+        let a1 = start + (end - start) * t1;
+        painter.line_segment(
+            [
+                center + egui::emath::Rot2::from_angle(a0) * egui::vec2(radius, 0.0),
+                center + egui::emath::Rot2::from_angle(a1) * egui::vec2(radius, 0.0),
+            ],
+            stroke,
+        );
+    }
 }
 
 fn live_pill(
@@ -466,37 +569,79 @@ fn live_pill(
     web_ok: bool,
     web_silent: bool,
 ) {
-    let (label, fill) = if !linked {
-        ("off", SURFACE)
-    } else if snap.state == ConnectionState::Failed {
-        ("failed", HOT)
-    } else if web_ok || snap.peers > 0 || snap.state == ConnectionState::Connected {
-        if web_silent && snap.peers == 0 {
-            ("live", PRIMARY)
-        } else {
-            ("live", OK)
+    let view = editor_view(ctx, linked, snap, web_ok, web_silent);
+    let pill = classify_session(view);
+    let (fill, tip) = match pill {
+        SessionPill::Off => (SURFACE, "Start sending"),
+        SessionPill::Failed => (HOT, "Bind failed — click to retry"),
+        SessionPill::Asleep => (WARN, "Silent — click to wake"),
+        SessionPill::Hosting | SessionPill::Streaming => {
+            (PRIMARY, "Ready — waiting for a listener")
         }
-    } else {
-        ("ready", PRIMARY)
+        SessionPill::Joining => (PRIMARY, "Joining"),
+        SessionPill::Live => (OK, "Pause or resume"),
     };
-    let button = egui::Button::new(egui::RichText::new(label).size(11.0).color(BG).strong())
-        .fill(fill)
-        .corner_radius(8.0)
-        .min_size(egui::vec2(54.0, 22.0));
-    if ui.add(button).on_hover_text("Pause or resume").clicked() {
-        ctx.params().link.set_value(!linked);
-        publish_control(ctx.params());
+    let button = egui::Button::new(
+        egui::RichText::new(pill.as_str())
+            .size(11.0)
+            .color(BG)
+            .strong(),
+    )
+    .fill(fill)
+    .corner_radius(4.0)
+    .min_size(egui::vec2(56.0, 22.0));
+    if ui.add(button).on_hover_text(tip).clicked() {
+        if pill == SessionPill::Asleep {
+            ctx.params().control.request_web_wake();
+        } else {
+            ctx.params().link.set_value(!linked);
+            publish_control(ctx.params());
+        }
     }
 }
 
+fn editor_view(
+    ctx: &PluginContext<RelayParams>,
+    linked: bool,
+    snap: relay_session::SessionSnapshot,
+    web_ok: bool,
+    web_silent: bool,
+) -> SessionView {
+    SessionView {
+        linked,
+        role: ctx.params().control.role(),
+        state: snap.state,
+        peers: snap.peers,
+        lan_browsers: ctx.params().control.lan_listeners(),
+        web_listeners: ctx.params().control.web_listeners(),
+        web_ok,
+        web_silent,
+        web_wanted: true,
+        bound: snap.bound,
+    }
+}
+
+fn editor_status(
+    ctx: &PluginContext<RelayParams>,
+    linked: bool,
+    snap: relay_session::SessionSnapshot,
+    web_ok: bool,
+    web_silent: bool,
+) -> String {
+    let view = editor_view(ctx, linked, snap, web_ok, web_silent);
+    let error = ctx.params().control.last_error().unwrap_or_default();
+    let who = ctx.params().control.who().unwrap_or_default();
+    format_session_status(view, snap.local_port, 0, snap.dropouts, &who, &error)
+}
+
 fn session_row(ui: &mut egui::Ui, state: &mut RelayUi, ctx: &PluginContext<RelayParams>) {
-    ui.label(egui::RichText::new("Session").size(11.0).color(MUTED));
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
-        let width = (ui.available_width() - 168.0).max(80.0);
+        let width = (ui.available_width() - 100.0).max(80.0);
         let name = ui.add(
             egui::TextEdit::singleline(&mut state.name_buf)
                 .desired_width(width)
+                .hint_text("session name")
                 .margin(egui::Margin::symmetric(10, 6)),
         );
         if name.lost_focus()
@@ -504,7 +649,7 @@ fn session_row(ui: &mut egui::Ui, state: &mut RelayUi, ctx: &PluginContext<Relay
         {
             commit_name(state, ctx);
         }
-        if chip(ui, "New").clicked() {
+        if icon_btn(ui, "bytes://phosphor/dice-five.svg", ICON_DICE, "New name").clicked() {
             state.name_buf = new_slug();
             commit_name(state, ctx);
         }
@@ -512,17 +657,55 @@ fn session_row(ui: &mut egui::Ui, state: &mut RelayUi, ctx: &PluginContext<Relay
             .copied
             .as_ref()
             .is_some_and(|(_, at)| at.elapsed() < Duration::from_secs(2));
-        if chip(ui, if copied { "Copied" } else { "Copy" }).clicked() {
+        let (copy_uri, copy_bytes, copy_tip) = if copied {
+            (
+                "bytes://phosphor/check.svg",
+                ICON_CHECK,
+                "Copied listen link",
+            )
+        } else {
+            ("bytes://phosphor/copy.svg", ICON_COPY, "Copy listen link")
+        };
+        if icon_btn(ui, copy_uri, copy_bytes, copy_tip).clicked() {
             commit_name(state, ctx);
-            let url = listen_url(ctx, &state.name_buf);
+            let url = public_url(&state.name_buf);
             copy_link(&url);
             ui.ctx().copy_text(url.clone());
             state.copied = Some((url, Instant::now()));
         }
-        if chip(ui, "Open").clicked() {
+        if icon_btn(
+            ui,
+            "bytes://phosphor/arrow-square-out.svg",
+            ICON_OPEN,
+            "Open listen page",
+        )
+        .clicked()
+        {
             commit_name(state, ctx);
-            let url = listen_url(ctx, &state.name_buf);
+            let url = public_url(&state.name_buf);
             let _ = open::that_detached(&url);
+        }
+    });
+}
+
+fn password_row(ui: &mut egui::Ui, state: &mut RelayUi, ctx: &PluginContext<RelayParams>) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        ui.add(
+            egui::Image::from_bytes("bytes://phosphor/lock-simple.svg", ICON_LOCK)
+                .fit_to_exact_size(egui::vec2(16.0, 16.0))
+                .tint(MUTED)
+                .alt_text("Password"),
+        );
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut state.pass_buf)
+                .password(true)
+                .hint_text("optional")
+                .desired_width(f32::INFINITY)
+                .margin(egui::Margin::symmetric(10, 6)),
+        );
+        if response.changed() || response.lost_focus() {
+            commit_password(ctx, &state.pass_buf);
         }
     });
 }
@@ -532,11 +715,13 @@ fn labeled_field(
     label: &str,
     value: &mut String,
     password: bool,
+    hint: &str,
     mut on_change: impl FnMut(&str),
 ) {
     ui.label(egui::RichText::new(label).size(11.0).color(MUTED));
     let mut edit = egui::TextEdit::singleline(value)
         .desired_width(f32::INFINITY)
+        .hint_text(hint)
         .margin(egui::Margin::symmetric(10, 6));
     if password {
         edit = edit.password(true);
@@ -548,16 +733,15 @@ fn labeled_field(
 }
 
 fn codec_row(ui: &mut egui::Ui, ctx: &PluginContext<RelayParams>) {
-    ui.label(egui::RichText::new("Codec").size(11.0).color(MUTED));
     let current = ctx.params().codec.value();
-    let label = codec_label(current);
+    let selected = codec_summary(ctx, current);
     egui::ComboBox::from_id_salt("relay-codec")
-        .selected_text(label)
+        .selected_text(selected)
         .width(ui.available_width())
         .show_ui(ui, |ui| {
             for value in [Codec::Opus, Codec::Flac, Codec::Pcm] {
                 if ui
-                    .selectable_label(current == value, codec_label(value))
+                    .selectable_label(current == value, codec_name(value))
                     .clicked()
                 {
                     ctx.params().codec.set_value(value);
@@ -565,23 +749,65 @@ fn codec_row(ui: &mut egui::Ui, ctx: &PluginContext<RelayParams>) {
                 }
             }
         });
-}
-
-fn codec_label(codec: Codec) -> &'static str {
-    match codec {
-        Codec::Opus => "Opus · 192 kbps",
-        Codec::Flac => "FLAC · 16-bit",
-        Codec::Pcm => "PCM · 16-bit LAN",
+    match current {
+        Codec::Opus => {
+            let mut kbps = ctx.params().bitrate.value();
+            let drag = ui.add(
+                egui::DragValue::new(&mut kbps)
+                    .range(64..=256)
+                    .suffix(" kbps")
+                    .speed(1.0),
+            );
+            if drag.changed() {
+                ctx.params().bitrate.set_value(kbps);
+                publish_control(ctx.params());
+            }
+        }
+        Codec::Flac => {
+            let mut level = ctx.params().flac_level.value();
+            let drag = ui.add(egui::DragValue::new(&mut level).range(0..=8).speed(1.0));
+            if drag.changed() {
+                ctx.params().flac_level.set_value(level);
+                publish_control(ctx.params());
+            }
+        }
+        Codec::Pcm => {}
     }
 }
 
-fn chip(ui: &mut egui::Ui, label: &str) -> egui::Response {
+fn codec_name(codec: Codec) -> &'static str {
+    match codec {
+        Codec::Opus => "Opus",
+        Codec::Flac => "FLAC",
+        Codec::Pcm => "PCM · LAN",
+    }
+}
+
+fn codec_summary(ctx: &PluginContext<RelayParams>, codec: Codec) -> String {
+    match codec {
+        Codec::Opus => format!("Opus · {} kbps", ctx.params().bitrate.value()),
+        Codec::Flac => format!("FLAC · {}", ctx.params().flac_level.value()),
+        Codec::Pcm => "PCM · 16-bit LAN".into(),
+    }
+}
+
+fn icon_btn(
+    ui: &mut egui::Ui,
+    uri: &'static str,
+    bytes: &'static [u8],
+    tip: &str,
+) -> egui::Response {
+    let image = egui::Image::from_bytes(uri, bytes)
+        .fit_to_exact_size(egui::vec2(16.0, 16.0))
+        .tint(TEXT);
     ui.add(
-        egui::Button::new(egui::RichText::new(label).size(11.0).color(TEXT).strong())
+        egui::Button::image(image)
             .fill(LANE)
-            .corner_radius(6.0)
-            .min_size(egui::vec2(44.0, 24.0)),
+            .corner_radius(4.0)
+            .min_size(egui::vec2(28.0, 28.0)),
     )
+    .on_hover_text(tip)
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 fn about_window(ui: &mut egui::Ui, overlay: &mut Overlay) {
@@ -598,12 +824,12 @@ fn about_window(ui: &mut egui::Ui, overlay: &mut Overlay) {
                 let _ = relay_logo(ui);
                 ui.add_space(8.0);
                 ui.label(
-                    egui::RichText::new("Low-latency listen")
+                    egui::RichText::new("Send the track. Hear it next door.")
                         .size(13.0)
                         .color(TEXT),
                 );
                 ui.label(
-                    egui::RichText::new("CLAP + VST3 · LAN first")
+                    egui::RichText::new("CLAP + VST3 · LAN and web")
                         .size(11.0)
                         .color(MUTED),
                 );
@@ -622,7 +848,7 @@ fn about_window(ui: &mut egui::Ui, overlay: &mut Overlay) {
                         MATARI_URL,
                     );
                     ui.label(
-                        egui::RichText::new("Made for producers who would rather keep creating.")
+                        egui::RichText::new("Share copies the listen link.")
                             .size(11.0)
                             .color(MUTED),
                     );
@@ -640,61 +866,6 @@ fn about_window(ui: &mut egui::Ui, overlay: &mut Overlay) {
     }
 }
 
-fn settings_window(ui: &mut egui::Ui, ctx: &PluginContext<RelayParams>, state: &mut RelayUi) {
-    let mut open = true;
-    egui::Window::new("Settings")
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 8.0])
-        .collapsible(false)
-        .resizable(false)
-        .open(&mut open)
-        .frame(egui::Frame::window(ui.style()).fill(SURFACE))
-        .show(ui.ctx(), |ui| {
-            ui.set_width(260.0);
-            ui.label(egui::RichText::new("Listen").size(11.0).color(MUTED));
-            let web_on = ctx.params().web.value();
-            if let Some(web) =
-                buffr_segmented(ui, "relay-web", &[(false, "LAN"), (true, "Web")], web_on)
-            {
-                ctx.params().web.set_value(web);
-                publish_control(ctx.params());
-            }
-            ui.add_space(12.0);
-            ui.label(egui::RichText::new("Defaults").size(11.0).color(MUTED));
-            if chip(ui, "Reset all values")
-                .on_hover_text("Send, Hear, codec, web, port")
-                .clicked()
-            {
-                reset_defaults(ctx, state);
-            }
-            ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new("Double-click a knob to reset it.")
-                    .size(11.0)
-                    .color(MUTED),
-            );
-        });
-    if !open {
-        state.overlay = Overlay::None;
-    }
-}
-
-fn reset_defaults(ctx: &PluginContext<RelayParams>, state: &mut RelayUi) {
-    ctx.automate(P::InputGain, f64::from(GAIN_DEFAULT_01));
-    ctx.automate(P::OutputGain, f64::from(GAIN_DEFAULT_01));
-    ctx.params().codec.set_value(Codec::Opus);
-    ctx.params().web.set_value(false);
-    ctx.params().bitrate.set_value(192);
-    ctx.params().flac_level.set_value(5);
-    ctx.params().port.set_value(17_492);
-    ctx.params().link.set_value(true);
-    state.pass_buf.clear();
-    if let Ok(mut session) = ctx.params().session.write() {
-        session.password.clear();
-    }
-    let _ = ctx.params().control.set_password(String::new());
-    publish_control(ctx.params());
-}
-
 fn paint_matari_mark(ui: &mut egui::Ui, size: egui::Vec2) {
     ui.add(
         egui::Image::from_bytes(
@@ -707,32 +878,47 @@ fn paint_matari_mark(ui: &mut egui::Ui, size: egui::Vec2) {
     );
 }
 
-impl RelayUi {
-    fn level_strip(&mut self, ui: &mut egui::Ui, ctx: &PluginContext<RelayParams>) {
-        let peak = ctx
-            .get_meter(P::MeterLeft)
-            .max(ctx.get_meter(P::MeterRight));
-        update_hold(&mut self.hold, &mut self.hold_age, peak);
-        let desired = egui::vec2(ui.available_width(), 22.0);
-        let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
-        paint_gyr_strip(ui.painter(), rect, peak_to_db(peak), peak_to_db(self.hold));
-    }
+fn meter_column(ui: &mut egui::Ui, peak: f32, hold: f32, label: &str) {
+    ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+        let db = peak_to_db(peak);
+        let clip = db >= -0.2;
+        let (lamp, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+        ui.painter().circle_filled(
+            lamp.center(),
+            3.5,
+            if clip {
+                HOT
+            } else {
+                egui::Color32::from_rgb(42, 32, 32)
+            },
+        );
+        ui.add_space(4.0);
+        let rail_h = (ui.available_height() - 18.0).max(48.0);
+        let (rail, _) = ui.allocate_exact_size(egui::vec2(10.0, rail_h), egui::Sense::hover());
+        paint_gyr_rail(ui.painter(), rail, db, peak_to_db(hold));
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(label)
+                .size(11.0)
+                .color(MUTED)
+                .strong()
+                .extra_letter_spacing(0.8),
+        );
+    });
 }
 
-fn paint_gyr_strip(painter: &egui::Painter, rect: egui::Rect, db: f32, hold: f32) {
-    painter.rect_filled(rect, 3.0, LANE);
+fn paint_gyr_rail(painter: &egui::Painter, rect: egui::Rect, db: f32, hold: f32) {
+    painter.rect_filled(rect, 2.0, SUNKEN);
     let rail = rect.shrink(1.0);
-    let stops = [
-        (0.00, egui::Color32::from_rgb(61, 143, 106)),
-        (0.42, OK),
-        (0.78, WARN),
-        (1.00, HOT),
-    ];
+    if rail.height() < 2.0 {
+        return;
+    }
+    let stops = [(0.00, GYR_FLOOR), (0.42, OK), (0.78, WARN), (1.00, HOT)];
     let mut mesh = egui::Mesh::default();
     for (t, color) in stops {
-        let x = rail.left() + rail.width() * t;
-        mesh.colored_vertex(egui::pos2(x, rail.top()), color);
-        mesh.colored_vertex(egui::pos2(x, rail.bottom()), color);
+        let y = rail.bottom() - rail.height() * t;
+        mesh.colored_vertex(egui::pos2(rail.left(), y), color);
+        mesh.colored_vertex(egui::pos2(rail.right(), y), color);
     }
     for i in 0_u32..3 {
         let n = i * 2;
@@ -744,18 +930,18 @@ fn paint_gyr_strip(painter: &egui::Painter, rect: egui::Rect, db: f32, hold: f32
     if pos < 1.0 {
         painter.rect_filled(
             egui::Rect::from_min_max(
-                egui::pos2(rail.left() + rail.width() * pos, rail.top()),
-                rail.max,
+                rail.min,
+                egui::pos2(rail.right(), rail.bottom() - rail.height() * pos),
             ),
             0.0,
-            LANE,
+            SUNKEN,
         );
     }
-    painter.vline(
-        rail.left() + rail.width() * db_to_pos(hold),
-        rail.y_range(),
-        egui::Stroke::new(1.4, TEXT),
-    );
+    let hold_pos = db_to_pos(hold);
+    if hold_pos > 0.02 {
+        let y = rail.bottom() - rail.height() * hold_pos;
+        painter.hline(rail.x_range(), y, egui::Stroke::new(1.0, TEXT));
+    }
 }
 
 fn peak_to_db(peak: f32) -> f32 {
@@ -784,54 +970,8 @@ fn update_hold(hold: &mut f32, age: &mut f32, peak: f32) {
     }
 }
 
-fn status_line(
-    linked: bool,
-    web_on: bool,
-    web_ok: bool,
-    silent: bool,
-    web: u32,
-    lan: usize,
-    lan_browsers: u32,
-) -> String {
-    if !linked {
-        return "Off".into();
-    }
-    let n = web as usize + lan + lan_browsers as usize;
-    if !web_on {
-        return if n == 0 {
-            "LAN only".into()
-        } else {
-            format!("LAN · {n} listening")
-        };
-    }
-    if !web_ok {
-        return "Web offline".into();
-    }
-    if silent && n == 0 {
-        return "Silent".into();
-    }
-    if n == 0 {
-        "Live".into()
-    } else {
-        format!("Live · {n} listening")
-    }
-}
-
 fn public_url(name: &str) -> String {
     format!("{PUBLIC_LINK_ORIGIN}/{}", normalize_slug(name))
-}
-
-fn lan_url_for(ctx: &PluginContext<RelayParams>) -> Option<String> {
-    let name = ctx.params().control.session_name().ok()?;
-    lan_listen_url(&name, ctx.params().control.lan_http_port())
-}
-
-fn listen_url(ctx: &PluginContext<RelayParams>, name: &str) -> String {
-    if ctx.params().web.value() {
-        public_url(name)
-    } else {
-        lan_url_for(ctx).unwrap_or_else(|| public_url(name))
-    }
 }
 
 fn commit_name(ui_state: &mut RelayUi, ctx: &PluginContext<RelayParams>) {
@@ -888,4 +1028,40 @@ fn pipe_copy(bin: &str, args: &[&str], value: &str) -> bool {
         .as_mut()
         .is_some_and(|stdin| stdin.write_all(value.as_bytes()).is_ok());
     wrote && child.wait().map(|status| status.success()).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use relay_session::{
+        ConnectionState, SessionRole, SessionView, classify_session, format_session_status,
+    };
+
+    fn view(silent: bool, web: u32) -> SessionView {
+        SessionView {
+            linked: true,
+            role: SessionRole::ConnectListen,
+            state: ConnectionState::Connecting,
+            peers: 0,
+            lan_browsers: 0,
+            web_listeners: web,
+            web_ok: true,
+            web_silent: silent,
+            web_wanted: true,
+            bound: true,
+        }
+    }
+
+    #[test]
+    fn status_line_names_asleep_when_silent() {
+        assert_eq!(classify_session(view(true, 0)).as_str(), "asleep");
+        assert!(
+            format_session_status(view(true, 2), Some(17_492), 8787, 0, "", "")
+                .starts_with("Asleep")
+        );
+        assert_eq!(classify_session(view(false, 0)).as_str(), "ready");
+        let ready = format_session_status(view(false, 0), Some(17_492), 8787, 0, "", "");
+        assert!(ready.starts_with("Ready"), "{ready}");
+        assert!(!ready.contains("UDP"), "{ready}");
+        assert!(!ready.contains("Web"), "{ready}");
+    }
 }
